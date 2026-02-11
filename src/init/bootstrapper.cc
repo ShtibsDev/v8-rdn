@@ -3450,6 +3450,17 @@ void Genesis::InitializeGlobal(DirectHandle<JSGlobalObject> global_object,
     native_context()->set_json_object(*json_object);
   }
 
+  {  // -- R D N
+    DirectHandle<JSObject> rdn =
+        factory->NewJSObject(isolate_->object_function(), AllocationType::kOld);
+    JSObject::AddProperty(isolate_, global, "RDN", rdn, DONT_ENUM);
+    SimpleInstallFunction(isolate_, rdn, "parse", Builtin::kRdnParse, 1,
+                          kDontAdapt);
+    SimpleInstallFunction(isolate_, rdn, "stringify", Builtin::kRdnStringify, 1,
+                          kAdapt);
+    InstallToStringTag(isolate_, rdn, "RDN");
+  }
+
   {  // -- M a t h
     DirectHandle<JSObject> math =
         factory->NewJSObject(isolate_->object_function(), AllocationType::kOld);

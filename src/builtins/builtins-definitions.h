@@ -810,6 +810,10 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
   CPP(JsonRawJson, JSParameterCount(1))                                        \
   CPP(JsonIsRawJson, JSParameterCount(1))                                      \
                                                                                \
+  /* RDN */                                                                    \
+  CPP(RdnParse, kDontAdaptArgumentsSentinel)                                   \
+  CPP(RdnStringify, JSParameterCount(1))                                       \
+                                                                               \
   /* ICs */                                                                    \
   TFH(LoadIC, LoadWithVector)                                                  \
   TFH(LoadIC_Megamorphic, LoadWithVector)                                      \
