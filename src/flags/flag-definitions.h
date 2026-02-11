@@ -870,6 +870,7 @@ DEFINE_BOOL(empty_context_extension_dep, true,
             "non-empty context extensions")
 
 DEFINE_BOOL(json_stringify_fast_path, true, "Enable JSON.stringify fast-path")
+DEFINE_BOOL(rdn_stringify_fast_path, true, "Enable RDN.stringify fast-path")
 
 // TODO(jgruber): Remove this flag.
 DEFINE_BOOL(cache_property_key_string_adds, true,

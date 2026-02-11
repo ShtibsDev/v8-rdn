@@ -31,6 +31,10 @@
 #include "src/objects/smi.h"
 #include "src/execution/protectors-inl.h"
 #include "src/strings/string-builder-inl.h"
+#include "src/base/small-vector.h"
+#include "src/objects/oddball-inl.h"
+#include "src/zone/zone.h"
+#include "src/zone/zone-list-inl.h"
 
 #include "hwy/highway.h"
 
@@ -1459,11 +1463,1583 @@ bool RdnStringifier::SerializeDuration(Handle<JSObject> object) {
   return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Fast-path RDN Stringifier (GC-free, continuation-based)
+// Modeled on FastJsonStringifier from json-stringifier.cc.
+// Runs GC-free for JSON-compatible types + Date.
+// Falls back to RdnStringifier for RDN-only types.
+// ═══════════════════════════════════════════════════════════════════
+
+static constexpr char kRdnStringifierZoneName[] = "rdn-stringifier-zone";
+
+template <typename Char>
+class RdnOutBuffer {
+ public:
+  explicit RdnOutBuffer(AccountingAllocator* allocator) : allocator_(allocator) {
+    cur_ = stack_buffer_;
+    segment_end_ = cur_ + kStackBufferSize;
+  }
+  template <typename SrcChar>
+    requires(sizeof(Char) >= sizeof(SrcChar))
+  V8_INLINE void AppendCharacter(SrcChar c) {
+    ReduceCurrentCapacity(1);
+    DCHECK_GE(SegmentFreeChars(), 1);
+    *cur_++ = c;
+  }
+  template <typename SrcChar>
+    requires(sizeof(Char) >= sizeof(SrcChar))
+  void Append(const SrcChar* chars, size_t length) {
+    ReduceCurrentCapacity(length);
+    DCHECK_GE(SegmentFreeChars(), length);
+    CopyChars(cur_, chars, length);
+    cur_ += length;
+  }
+  void EnsureCapacity(size_t size) {
+#ifdef DEBUG
+    current_requested_capacity_ = size;
+#endif
+    if (V8_LIKELY(size <= SegmentFreeChars())) return;
+    Extend(size);
+    DCHECK_GE(CurSegmentCapacity(), size);
+  }
+  size_t length() const {
+    if (ZoneUsed()) {
+      DCHECK_GT(segments_->length(), 0);
+      size_t len = stack_buffer_size_;
+      for (int i = 0; i < segments_->length() - 1; i++) {
+        len += segments_->at(i).size();
+      }
+      len += CurSegmentLength();
+      return len;
+    } else {
+      return StackBufferLength();
+    }
+  }
+  template <typename Dst>
+  void CopyTo(Dst* dst) {
+    if (ZoneUsed()) {
+      CopyChars(dst, stack_buffer_, stack_buffer_size_);
+      dst += stack_buffer_size_;
+      DCHECK_GT(segments_->length(), 0);
+      for (int i = 0; i < segments_->length() - 1; i++) {
+        base::Vector<Char> seg = segments_.value()[i];
+        CopyChars(dst, seg.begin(), seg.size());
+        dst += seg.size();
+      }
+      base::Vector<Char> seg = segments_->last();
+      CopyChars(dst, seg.begin(), CurSegmentLength());
+    } else {
+      CopyChars(dst, stack_buffer_, StackBufferLength());
+    }
+  }
+
+ private:
+  static constexpr uint32_t kInitialSegmentSize = 2 * KB;
+  static constexpr uint32_t kMaxSegmentSize = 32 * KB;
+  static_assert(base::bits::IsPowerOfTwo(kInitialSegmentSize));
+  static_assert(base::bits::IsPowerOfTwo(kMaxSegmentSize));
+  static constexpr uint8_t kInitialSegmentSizeHighestBit =
+      kBitsPerInt - base::bits::CountLeadingZeros32(kInitialSegmentSize) - 1;
+  static constexpr uint8_t kMaxSegmentSizeHighestBit =
+      kBitsPerInt - base::bits::CountLeadingZeros32(kMaxSegmentSize) - 1;
+  static constexpr size_t kStackBufferSize = 256;
+
+  V8_NOINLINE V8_PRESERVE_MOST void Extend(size_t min_size) {
+    if (ZoneUsed()) {
+      segments_->last().Truncate(CurSegmentLength());
+    } else {
+      stack_buffer_size_ = StackBufferLength();
+      zone_.emplace(allocator_, kRdnStringifierZoneName);
+      segments_.emplace(1, &zone_.value());
+    }
+    const size_t new_segment_size =
+        std::max(min_size, SegmentCapacity(segments_->length()));
+    segments_->Add(zone_->AllocateVector<Char>(new_segment_size),
+                   &zone_.value());
+    cur_ = segments_->last().begin();
+    segment_end_ = segments_->last().end();
+  }
+  V8_INLINE size_t SegmentFreeChars() const { return segment_end_ - cur_; }
+  V8_INLINE size_t StackBufferLength() const {
+    DCHECK(!ZoneUsed());
+    return cur_ - stack_buffer_;
+  }
+  V8_INLINE size_t CurSegmentLength() const {
+    DCHECK(ZoneUsed());
+    return cur_ - segments_->last().begin();
+  }
+  V8_INLINE size_t SegmentCapacity(size_t segment) {
+    return 1u << std::min<size_t>(segment + kInitialSegmentSizeHighestBit,
+                                  kMaxSegmentSizeHighestBit);
+  }
+  V8_INLINE size_t CurSegmentCapacity() {
+    DCHECK(ZoneUsed());
+    DCHECK_GT(segments_->length(), 0);
+    return segments_->last().size();
+  }
+  V8_INLINE void ReduceCurrentCapacity(size_t size) {
+#ifdef DEBUG
+    DCHECK_LE(size, current_requested_capacity_);
+    current_requested_capacity_ -= size;
+#endif
+  }
+  V8_INLINE bool ZoneUsed() const { return zone_.has_value(); }
+
+  AccountingAllocator* allocator_;
+  Char stack_buffer_[kStackBufferSize];
+  size_t stack_buffer_size_;
+  Char* cur_;
+  Char* segment_end_;
+  std::optional<Zone> zone_;
+  std::optional<ZoneList<base::Vector<Char>>> segments_;
+#ifdef DEBUG
+  size_t current_requested_capacity_;
+#endif
+};
+
+enum FastRdnStringifierResult {
+  SUCCESS, JS_OBJECT, JS_ARRAY, UNDEFINED, CHANGE_ENCODING, SLOW_PATH,
+  EXCEPTION
+};
+
+enum class FastRdnStringifierObjectKeyResult : uint8_t {
+  kSuccess, kChangeEncoding, kSlow
+};
+
+class RdnContinuationRecord {
+ public:
+  enum Type {
+    kObject, kArray,
+    kObjectResume_FastIterable, kObjectResume_SlowIterable,
+    kObjectResume_Uninitialized,
+    kArrayResume, kArrayResume_Holey,
+    kArrayResume_WithInterrupts, kArrayResume_Holey_WithInterrupts,
+    kSimpleObject, kObjectKey
+  };
+  using ObjectT = UnionOf<JSAny, FixedArrayBase>;
+
+  static constexpr RdnContinuationRecord ForSimpleObject(Tagged<JSAny> obj) {
+    return RdnContinuationRecord(Type::kSimpleObject, obj, 0, 0);
+  }
+  static constexpr RdnContinuationRecord ForJSAny(
+      Tagged<JSAny> obj, FastRdnStringifierResult result) {
+    return RdnContinuationRecord(ContinuationTypeFromResult(result), obj, 0, 0);
+  }
+  static constexpr RdnContinuationRecord ForJSArray(Tagged<JSAny> obj) {
+    DCHECK(Is<JSArray>(obj));
+    return RdnContinuationRecord(Type::kArray, obj, 0, 0);
+  }
+  template <ElementsKind kind, bool with_interrupt_check>
+  static constexpr RdnContinuationRecord ForJSArrayResume(
+      Tagged<FixedArrayBase> obj, uint32_t index, uint32_t length) {
+    return RdnContinuationRecord(
+        ContinuationTypeForArray(kind, with_interrupt_check), obj, index,
+        length);
+  }
+  static constexpr RdnContinuationRecord ForJSObject(Tagged<JSAny> obj) {
+    DCHECK(Is<JSObject>(obj));
+    return RdnContinuationRecord(Type::kObject, obj, 0, 0, 0, 0,
+                                 Tagged<DescriptorArray>());
+  }
+  template <DescriptorArray::FastIterableState fast_iterable_state>
+  static constexpr RdnContinuationRecord ForJSObjectResume(
+      Tagged<JSAny> obj, uint16_t descriptor_idx, uint16_t nof_descriptors,
+      uint8_t in_object_properties, uint8_t in_object_properties_start,
+      Tagged<DescriptorArray> descriptors) {
+    DCHECK(Is<JSObject>(obj));
+    Type type;
+    using enum DescriptorArray::FastIterableState;
+    switch (fast_iterable_state) {
+      case kJsonFast: type = Type::kObjectResume_FastIterable; break;
+      case kJsonSlow: type = Type::kObjectResume_SlowIterable; break;
+      case kUnknown: type = Type::kObjectResume_Uninitialized; break;
+    }
+    return RdnContinuationRecord(type, obj, descriptor_idx, nof_descriptors,
+                                 in_object_properties,
+                                 in_object_properties_start, descriptors);
+  }
+  static constexpr RdnContinuationRecord ForObjectKey(Tagged<String> key,
+                                                      bool comma) {
+    return RdnContinuationRecord(Type::kObjectKey, key, comma);
+  }
+
+  Type type() const { return type_; }
+  Tagged<ObjectT> object() const { return object_; }
+  Tagged<JSAny> simple_object() const {
+    DCHECK_EQ(type(), Type::kSimpleObject);
+    return Cast<JSAny>(object_);
+  }
+  Tagged<JSArray> js_array() const {
+    DCHECK_EQ(type(), Type::kArray);
+    return Cast<JSArray>(object_);
+  }
+  Tagged<FixedArrayBase> array_elements() const {
+    DCHECK(IsArrayResumeType(type()));
+    return Cast<FixedArrayBase>(object_);
+  }
+  Tagged<JSObject> js_object() const {
+    DCHECK(type() == Type::kObject || IsObjectResumeType(type()));
+    return Cast<JSObject>(object_);
+  }
+  Tagged<String> object_key() const {
+    DCHECK_EQ(type(), Type::kObjectKey);
+    return Cast<String>(object_);
+  }
+  uint32_t array_index() const {
+    DCHECK(IsArrayResumeType(type()));
+    return js_array_.index;
+  }
+  uint32_t array_length() const {
+    DCHECK(IsArrayResumeType(type()));
+    return js_array_.length;
+  }
+  uint16_t object_descriptor_idx() const {
+    DCHECK(IsObjectResumeType(type()));
+    return js_object_.descriptor_idx;
+  }
+  uint16_t object_nof_descriptors() const {
+    DCHECK(IsObjectResumeType(type()));
+    return js_object_.nof_descriptors;
+  }
+  uint8_t object_in_object_properties() const {
+    DCHECK(IsObjectResumeType(type()));
+    return js_object_.in_object_properties;
+  }
+  uint8_t object_in_object_properties_start() const {
+    DCHECK(IsObjectResumeType(type()));
+    return js_object_.in_object_properties_start;
+  }
+  Tagged<DescriptorArray> object_descriptors() const {
+    DCHECK(IsObjectResumeType(type()));
+    return js_object_.descriptors;
+  }
+  bool object_key_comma() const {
+    DCHECK_EQ(type(), Type::kObjectKey);
+    return object_key_.comma;
+  }
+
+  static constexpr bool IsObjectResumeType(Type type) {
+    return type == Type::kObjectResume_FastIterable ||
+           type == Type::kObjectResume_SlowIterable ||
+           type == Type::kObjectResume_Uninitialized;
+  }
+  static constexpr bool IsArrayResumeType(Type type) {
+    return type == Type::kArrayResume || type == Type::kArrayResume_Holey ||
+           type == Type::kArrayResume_WithInterrupts ||
+           type == Type::kArrayResume_Holey_WithInterrupts;
+  }
+
+ private:
+  constexpr RdnContinuationRecord(Type type, Tagged<ObjectT> obj,
+                                  uint32_t index, uint32_t length)
+      : type_(type), object_(obj), js_array_({index, length}) {}
+  constexpr RdnContinuationRecord(Type type, Tagged<ObjectT> obj,
+                                  uint16_t descriptor_idx,
+                                  uint16_t nof_descriptors,
+                                  uint8_t in_object_properties,
+                                  uint8_t in_object_properties_start,
+                                  Tagged<DescriptorArray> descriptors)
+      : type_(type),
+        object_(obj),
+        js_object_({descriptor_idx, nof_descriptors, in_object_properties,
+                    in_object_properties_start, descriptors}) {}
+  constexpr RdnContinuationRecord(Type type, Tagged<ObjectT> obj, bool comma)
+      : type_(type), object_(obj), object_key_{comma} {}
+
+  static constexpr Type ContinuationTypeFromResult(
+      FastRdnStringifierResult result) {
+    DCHECK(result == JS_OBJECT || result == JS_ARRAY);
+    static_assert(JS_OBJECT - 1 == Type::kObject);
+    static_assert(JS_ARRAY - 1 == Type::kArray);
+    return static_cast<Type>(result - 1);
+  }
+  static consteval Type ContinuationTypeForArray(ElementsKind kind,
+                                                 bool with_interrupt_check) {
+    DCHECK(IsObjectElementsKind(kind));
+    if (IsHoleyElementsKind(kind)) {
+      return with_interrupt_check ? kArrayResume_Holey_WithInterrupts
+                                  : kArrayResume_Holey;
+    } else {
+      return with_interrupt_check ? kArrayResume_WithInterrupts
+                                  : kArrayResume;
+    }
+  }
+
+  Type type_;
+  Tagged<ObjectT> object_;
+  union {
+    struct { uint32_t index; uint32_t length; } js_array_;
+    struct {
+      uint16_t descriptor_idx;
+      uint16_t nof_descriptors;
+      uint8_t in_object_properties;
+      uint8_t in_object_properties_start;
+      Tagged<DescriptorArray> descriptors;
+    } js_object_;
+    struct { bool comma; } object_key_;
+  };
+};
+
+// ── Helpers ──
+
+size_t RdnMaxEscapedStringLength(size_t length) { return length << 3; }
+
+bool RdnIsFastKey(Tagged<String> key, const DisallowGarbageCollection& no_gc) {
+  if (IsSeqOneByteString(key)) {
+    Tagged<SeqOneByteString> seq = Cast<SeqOneByteString>(key);
+    return DoNotEscapeString(seq->GetChars(no_gc), seq->length());
+  }
+  if (IsExternalOneByteString(key)) {
+    Tagged<ExternalOneByteString> ext = Cast<ExternalOneByteString>(key);
+    return DoNotEscapeString(ext->GetChars(), ext->length());
+  }
+  return false;
+}
+
+V8_INLINE bool CanFastSerializeRdnJSArrayFastPath(
+    Tagged<JSArray> object, Tagged<HeapObject> initial_proto, Isolate* isolate) {
+  Tagged<HeapObject> proto = object->map()->prototype();
+  return V8_LIKELY(proto == initial_proto);
+}
+
+V8_INLINE bool CanFastSerializeRdnJSObjectFastPath(
+    Tagged<JSObject> object, Tagged<HeapObject> initial_proto, Tagged<Map> map,
+    Isolate* isolate) {
+  if (V8_UNLIKELY(IsCustomElementsReceiverMap(map))) return false;
+  if (V8_UNLIKELY(!object->HasFastProperties())) return false;
+  auto roots = ReadOnlyRoots(isolate);
+  auto elements = object->elements();
+  if (V8_UNLIKELY(elements != roots.empty_fixed_array() &&
+                  elements != roots.empty_slow_element_dictionary())) {
+    return false;
+  }
+  Tagged<HeapObject> proto = map->prototype();
+  return V8_LIKELY(proto == initial_proto);
+}
+
+// ── FastRdnStringifier class ──
+
+template <typename Char>
+class FastRdnStringifier {
+ public:
+  explicit FastRdnStringifier(Isolate* isolate);
+  size_t ResultLength() const { return buffer_.length(); }
+  template <typename DstChar>
+  void CopyResultTo(DstChar* out_buffer) { buffer_.CopyTo(out_buffer); }
+  V8_INLINE FastRdnStringifierResult
+  SerializeObject(Tagged<JSAny> object, const DisallowGarbageCollection& no_gc);
+  template <typename OldChar>
+    requires(sizeof(OldChar) < sizeof(Char))
+  V8_NOINLINE FastRdnStringifierResult
+  ResumeFrom(FastRdnStringifier<OldChar>& old,
+             const DisallowGarbageCollection& no_gc);
+
+ private:
+  static constexpr bool is_one_byte = sizeof(Char) == sizeof(uint8_t);
+  V8_INLINE void SeparatorUnchecked(bool comma) {
+    if (comma) AppendCharacterUnchecked(',');
+  }
+  V8_INLINE void Separator(bool comma) {
+    if (comma) AppendCharacter(',');
+  }
+  V8_INLINE void EnsureCapacity(size_t size) { buffer_.EnsureCapacity(size); }
+  template <typename SrcChar>
+  V8_INLINE void AppendCharacterUnchecked(SrcChar c) {
+    buffer_.AppendCharacter(c);
+  }
+  template <typename SrcChar>
+  V8_INLINE void AppendCharacter(SrcChar c) {
+    EnsureCapacity(1);
+    AppendCharacterUnchecked(c);
+  }
+  template <size_t N>
+  V8_INLINE void AppendCStringLiteralUnchecked(const char (&literal)[N]) {
+    constexpr size_t length = N - 1;
+    static_assert(length > 0);
+    if constexpr (length == 1) return AppendCharacterUnchecked(literal[0]);
+    buffer_.Append(reinterpret_cast<const uint8_t*>(literal), length);
+  }
+  template <size_t N>
+  V8_INLINE void AppendCStringLiteral(const char (&literal)[N]) {
+    constexpr size_t length = N - 1;
+    static_assert(length > 0);
+    EnsureCapacity(length);
+    AppendCStringLiteralUnchecked(literal);
+  }
+  V8_INLINE void AppendCStringUnchecked(const char* chars, size_t len) {
+    buffer_.Append(reinterpret_cast<const unsigned char*>(chars), len);
+  }
+  V8_INLINE void AppendCStringUnchecked(const char* chars) {
+    AppendCStringUnchecked(chars, strlen(chars));
+  }
+  V8_INLINE void AppendStringUnchecked(std::string_view str) {
+    AppendCStringUnchecked(str.data(), str.length());
+  }
+  V8_INLINE void AppendCString(const char* chars, size_t len) {
+    EnsureCapacity(len);
+    AppendCStringUnchecked(chars, len);
+  }
+  V8_INLINE void AppendString(std::string_view str) {
+    AppendCString(str.data(), str.length());
+  }
+
+  V8_INLINE void SerializeSmi(Tagged<Smi> object);
+  void SerializeDouble(double number);
+  void SerializeDate(Tagged<JSDate> date);
+  template <bool no_escaping>
+  FastRdnStringifierObjectKeyResult SerializeObjectKey(
+      Tagged<String> key, bool comma, const DisallowGarbageCollection& no_gc);
+  template <typename StringT, bool no_escaping>
+  FastRdnStringifierObjectKeyResult SerializeObjectKey(
+      Tagged<String> key, bool comma, const DisallowGarbageCollection& no_gc);
+  template <typename StringT>
+  V8_INLINE FastRdnStringifierResult SerializeString(
+      Tagged<HeapObject> str, const DisallowGarbageCollection& no_gc);
+  FastRdnStringifierResult TrySerializeSimpleObject(Tagged<JSAny> object);
+  FastRdnStringifierResult SerializeObject(
+      RdnContinuationRecord cont, const DisallowGarbageCollection& no_gc);
+  V8_INLINE FastRdnStringifierResult SerializeJSObject(
+      Tagged<JSObject> obj, const DisallowGarbageCollection& no_gc);
+  template <DescriptorArray::FastIterableState fast_iterable_state>
+  V8_INLINE FastRdnStringifierResult ResumeJSObject(
+      Tagged<JSObject> obj, uint16_t start_descriptor_idx,
+      uint16_t nof_descriptors, uint8_t in_object_properties,
+      uint8_t in_object_properties_start, Tagged<DescriptorArray> descriptors,
+      bool comma, const DisallowGarbageCollection& no_gc);
+  FastRdnStringifierResult SerializeJSArray(Tagged<JSArray> array);
+  template <ElementsKind kind>
+  FastRdnStringifierResult SerializeFixedArrayWithInterruptCheck(
+      Tagged<FixedArrayBase> elements, uint32_t start_index, uint32_t length);
+  template <ElementsKind kind>
+  V8_INLINE FastRdnStringifierResult SerializeFixedArray(
+      Tagged<FixedArrayBase> array, uint32_t start_idx, uint32_t length);
+  template <ElementsKind kind, bool with_interrupt_checks, typename T>
+  V8_INLINE FastRdnStringifierResult
+  SerializeFixedArrayElement(Tagged<T> elements, uint32_t i, uint32_t length);
+  V8_NOINLINE FastRdnStringifierResult HandleInterruptAndCheckCycle();
+  V8_NOINLINE bool CheckCycle();
+
+  template <typename SrcChar>
+    requires(sizeof(SrcChar) == sizeof(uint8_t))
+  V8_INLINE bool AppendString(const SrcChar* chars, size_t length,
+                              const DisallowGarbageCollection& no_gc);
+  template <typename SrcChar>
+  V8_INLINE void AppendStringNoEscapes(const SrcChar* chars, size_t length,
+                                       const DisallowGarbageCollection& no_gc);
+  template <typename SrcChar>
+    requires(sizeof(SrcChar) == sizeof(uint8_t))
+  bool AppendStringScalar(const SrcChar* chars, size_t length, size_t start,
+                          size_t uncopied_src_index,
+                          const DisallowGarbageCollection& no_gc);
+  template <typename SrcChar>
+    requires(sizeof(SrcChar) == sizeof(uint8_t))
+  V8_INLINE bool AppendStringSWAR(const SrcChar* chars, size_t length,
+                                  size_t start, size_t uncopied_src_index,
+                                  const DisallowGarbageCollection& no_gc);
+  template <typename SrcChar>
+    requires(sizeof(SrcChar) == sizeof(uint8_t))
+  V8_INLINE bool AppendStringSIMD(const SrcChar* chars, size_t length,
+                                  const DisallowGarbageCollection& no_gc);
+  template <typename SrcChar>
+    requires(sizeof(SrcChar) == sizeof(base::uc16))
+  V8_INLINE bool AppendString(const SrcChar* chars, size_t length,
+                              const DisallowGarbageCollection& no_gc);
+
+  using FastIterableState = DescriptorArray::FastIterableState;
+  static constexpr uint32_t kGlobalInterruptBudget = 200000;
+  static constexpr uint32_t kArrayInterruptLength = 4000;
+
+  Isolate* isolate_;
+  RdnOutBuffer<Char> buffer_;
+  base::SmallVector<RdnContinuationRecord, 16> stack_;
+  Tagged<HeapObject> initial_jsobject_proto_;
+  Tagged<HeapObject> initial_jsarray_proto_;
+  template <typename> friend class FastRdnStringifier;
+};
+
+// ── Constructor ──
+
+template <typename Char>
+FastRdnStringifier<Char>::FastRdnStringifier(Isolate* isolate)
+    : isolate_(isolate), buffer_(isolate->allocator()) {}
+
+// ── Leaf serializers ──
+
+template <typename Char>
+void FastRdnStringifier<Char>::SerializeSmi(Tagged<Smi> object) {
+  static_assert(Smi::kMaxValue <= 2147483647);
+  static_assert(Smi::kMinValue >= -2147483648);
+  static constexpr uint32_t kBufferSize = sizeof("-2147483648") - 1;
+  char chars[kBufferSize];
+  base::Vector<char> buffer(chars, kBufferSize);
+  std::string_view str = IntToStringView(object.value(), buffer);
+  AppendString(str);
+}
+
+template <typename Char>
+void FastRdnStringifier<Char>::SerializeDouble(double number) {
+  // RDN: NaN and Infinity are literals, not "null".
+  if (V8_UNLIKELY(std::isnan(number))) {
+    AppendCStringLiteral("NaN");
+    return;
+  }
+  if (V8_UNLIKELY(std::isinf(number))) {
+    if (number > 0) {
+      AppendCStringLiteral("Infinity");
+    } else {
+      AppendCStringLiteral("-Infinity");
+    }
+    return;
+  }
+  static constexpr uint32_t kBufferSize = 100;
+  char chars[kBufferSize];
+  base::Vector<char> buffer(chars, kBufferSize);
+  std::string_view str = DoubleToStringView(number, buffer);
+  AppendString(str);
+}
+
+template <typename Char>
+void FastRdnStringifier<Char>::SerializeDate(Tagged<JSDate> date) {
+  double value = date->value();
+  if (std::isnan(value)) {
+    AppendCStringLiteral("null");
+    return;
+  }
+  int64_t time_ms = static_cast<int64_t>(value);
+  static constexpr int kMsPerSecond = 1000;
+  static constexpr int kMsPerMinute = 60 * kMsPerSecond;
+  static constexpr int kMsPerHour = 60 * kMsPerMinute;
+  static constexpr int64_t kMsPerDay = 24 * kMsPerHour;
+  int64_t days64;
+  if (time_ms >= 0) {
+    days64 = time_ms / kMsPerDay;
+  } else {
+    days64 = (time_ms - (kMsPerDay - 1)) / kMsPerDay;
+  }
+  int time_in_day_ms = static_cast<int>(time_ms - days64 * kMsPerDay);
+  int days = static_cast<int>(days64);
+  int ms = time_in_day_ms % kMsPerSecond;
+  int sec = (time_in_day_ms / kMsPerSecond) % 60;
+  int min = (time_in_day_ms / kMsPerMinute) % 60;
+  int hour = (time_in_day_ms / kMsPerHour) % 24;
+  // Civil date from days since epoch (Howard Hinnant's algorithm).
+  int z = days + 719468;
+  int era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = static_cast<unsigned>(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int y = static_cast<int>(yoe) + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  unsigned m = mp < 10 ? mp + 3 : mp - 9;
+  if (m <= 2) y++;
+  // @YYYY-MM-DDTHH:mm:ss.sssZ = 25 chars max
+  char buf[32];
+  snprintf(buf, sizeof(buf), "@%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+           y, static_cast<int>(m), static_cast<int>(d), hour, min, sec, ms);
+  AppendCString(buf, strlen(buf));
+}
+
+// ── String serialization (SIMD/SWAR/Scalar with RdnEscapeTable) ──
+
+template <typename Char>
+template <typename SrcChar>
+  requires(sizeof(SrcChar) == sizeof(uint8_t))
+bool FastRdnStringifier<Char>::AppendString(
+    const SrcChar* chars, size_t length,
+    const DisallowGarbageCollection& no_gc) {
+  constexpr int kUseSimdLengthThreshold = 32;
+  if (length >= kUseSimdLengthThreshold) {
+    return AppendStringSIMD(chars, length, no_gc);
+  }
+  return AppendStringSWAR(chars, length, 0, 0, no_gc);
+}
+
+template <typename Char>
+template <typename SrcChar>
+void FastRdnStringifier<Char>::AppendStringNoEscapes(
+    const SrcChar* chars, size_t length,
+    const DisallowGarbageCollection& no_gc) {
+  buffer_.Append(chars, length);
+}
+
+template <typename Char>
+template <typename SrcChar>
+  requires(sizeof(SrcChar) == sizeof(uint8_t))
+bool FastRdnStringifier<Char>::AppendStringScalar(
+    const SrcChar* chars, size_t length, size_t start,
+    size_t uncopied_src_index, const DisallowGarbageCollection& no_gc) {
+  bool needs_escaping = false;
+  for (size_t i = start; i < length; i++) {
+    SrcChar c = chars[i];
+    if (V8_LIKELY(DoNotEscape(c))) continue;
+    needs_escaping = true;
+    buffer_.Append(chars + uncopied_src_index, i - uncopied_src_index);
+    AppendCStringUnchecked(
+        &RdnEscapeTable[c * kRdnEscapeTableEntrySize]);
+    uncopied_src_index = i + 1;
+  }
+  if (V8_LIKELY(uncopied_src_index < length)) {
+    buffer_.Append(chars + uncopied_src_index, length - uncopied_src_index);
+  }
+  return needs_escaping;
+}
+
+template <typename Char>
+template <typename SrcChar>
+  requires(sizeof(SrcChar) == sizeof(uint8_t))
+V8_CLANG_NO_SANITIZE("alignment")
+bool FastRdnStringifier<Char>::AppendStringSWAR(
+    const SrcChar* chars, size_t length, size_t start,
+    size_t uncopied_src_index, const DisallowGarbageCollection& no_gc) {
+  using PackedT = uint32_t;
+  static constexpr size_t stride = sizeof(PackedT);
+  size_t i = start;
+  for (; i + (stride - 1) < length; i += stride) {
+    PackedT packed = *reinterpret_cast<const PackedT*>(chars + i);
+    if (V8_UNLIKELY(NeedsEscape(packed))) break;
+  }
+  return AppendStringScalar(chars, length, i, uncopied_src_index, no_gc);
+}
+
+template <typename Char>
+template <typename SrcChar>
+  requires(sizeof(SrcChar) == sizeof(uint8_t))
+bool FastRdnStringifier<Char>::AppendStringSIMD(
+    const SrcChar* chars, size_t length,
+    const DisallowGarbageCollection& no_gc) {
+  namespace hw = hwy::HWY_NAMESPACE;
+  bool needs_escaping = false;
+  size_t uncopied_src_index = 0;
+  const SrcChar* block = chars;
+  const SrcChar* end = chars + length;
+  hw::FixedTag<SrcChar, 16> tag;
+  static const size_t stride = hw::Lanes(tag);
+  const auto mask_0x20 = hw::Set(tag, 0x20);
+  const auto mask_0x22 = hw::Set(tag, 0x22);
+  const auto mask_0x5c = hw::Set(tag, 0x5c);
+  for (; block + (stride - 1) < end; block += stride) {
+    const auto input = hw::LoadU(tag, block);
+    const auto has_lower_than_0x20 = hw::Lt(input, mask_0x20);
+    const auto has_0x22 = hw::Eq(input, mask_0x22);
+    const auto has_0x5c = hw::Eq(input, mask_0x5c);
+    const auto result =
+        hw::Or(hw::Or(has_lower_than_0x20, has_0x22), has_0x5c);
+    if (V8_LIKELY(hw::AllFalse(tag, result))) continue;
+    needs_escaping = true;
+    size_t index = hw::FindKnownFirstTrue(tag, result);
+    Char found_char = block[index];
+    const size_t char_index = block - chars + index;
+    buffer_.Append(chars + uncopied_src_index,
+                   char_index - uncopied_src_index);
+    DCHECK_LT(found_char, 0x60);
+    AppendCStringUnchecked(
+        &RdnEscapeTable[found_char * kRdnEscapeTableEntrySize]);
+    uncopied_src_index = char_index + 1;
+    block += index + 1;
+    block -= stride;
+  }
+  const size_t start_index = block - chars;
+  return AppendStringSWAR(chars, length, start_index, uncopied_src_index,
+                          no_gc) ||
+         needs_escaping;
+}
+
+template <typename Char>
+template <typename SrcChar>
+  requires(sizeof(SrcChar) == sizeof(base::uc16))
+bool FastRdnStringifier<Char>::AppendString(
+    const SrcChar* chars, size_t length,
+    const DisallowGarbageCollection& no_gc) {
+  bool needs_escaping = false;
+  uint32_t uncopied_src_index = 0;
+  for (uint32_t i = 0; i < length; i++) {
+    SrcChar c = chars[i];
+    if (V8_LIKELY(DoNotEscape(c))) continue;
+    needs_escaping = true;
+    if (sizeof(SrcChar) != 1 &&
+        base::IsInRange(c, static_cast<SrcChar>(0xD800),
+                        static_cast<SrcChar>(0xDFFF))) {
+      buffer_.Append(chars + uncopied_src_index, i - uncopied_src_index);
+      char double_to_radix_chars[kDoubleToRadixMaxChars];
+      base::Vector<char> double_to_radix_buffer =
+          base::ArrayVector(double_to_radix_chars);
+      if (c <= 0xDBFF) {
+        if (i + 1 < length) {
+          SrcChar next = chars[i + 1];
+          if (base::IsInRange(next, static_cast<SrcChar>(0xDC00),
+                              static_cast<SrcChar>(0xDFFF))) {
+            AppendCharacterUnchecked(c);
+            AppendCharacterUnchecked(next);
+            i++;
+          } else {
+            AppendCStringLiteralUnchecked("\\u");
+            AppendStringUnchecked(
+                DoubleToRadixStringView(c, 16, double_to_radix_buffer));
+          }
+        } else {
+          AppendCStringLiteralUnchecked("\\u");
+          AppendStringUnchecked(
+              DoubleToRadixStringView(c, 16, double_to_radix_buffer));
+        }
+      } else {
+        AppendCStringLiteralUnchecked("\\u");
+        AppendStringUnchecked(
+            DoubleToRadixStringView(c, 16, double_to_radix_buffer));
+      }
+      uncopied_src_index = i + 1;
+    } else {
+      buffer_.Append(chars + uncopied_src_index, i - uncopied_src_index);
+      DCHECK_LT(c, 0x60);
+      AppendCStringUnchecked(
+          &RdnEscapeTable[c * kRdnEscapeTableEntrySize]);
+      uncopied_src_index = i + 1;
+    }
+  }
+  if (uncopied_src_index < length) {
+    buffer_.Append(chars + uncopied_src_index, length - uncopied_src_index);
+  }
+  return needs_escaping;
+}
+
+// ── Object key serialization ──
+
+template <typename Char>
+template <bool no_escaping>
+FastRdnStringifierObjectKeyResult
+FastRdnStringifier<Char>::SerializeObjectKey(
+    Tagged<String> key, bool comma, const DisallowGarbageCollection& no_gc) {
+#if V8_STATIC_ROOTS_BOOL
+  ReadOnlyRoots roots(isolate_);
+  Tagged<Map> map = key->map();
+  if (map == roots.internalized_one_byte_string_map()) {
+    V8_INLINE_STATEMENT return SerializeObjectKey<SeqOneByteString,
+                                                  no_escaping>(key, comma,
+                                                               no_gc);
+  } else if (map == roots.external_internalized_one_byte_string_map() ||
+             map ==
+                 roots.uncached_external_internalized_one_byte_string_map()) {
+    V8_INLINE_STATEMENT return SerializeObjectKey<ExternalOneByteString,
+                                                  no_escaping>(key, comma,
+                                                               no_gc);
+  } else {
+    if constexpr (is_one_byte) {
+      DCHECK(InstanceTypeChecker::IsTwoByteString(map));
+      if constexpr (no_escaping) {
+        UNREACHABLE();
+      } else {
+        return FastRdnStringifierObjectKeyResult::kChangeEncoding;
+      }
+    } else {
+      if (map == roots.internalized_two_byte_string_map()) {
+        return SerializeObjectKey<SeqTwoByteString, no_escaping>(key, comma,
+                                                                 no_gc);
+      } else if (
+          map == roots.external_internalized_two_byte_string_map() ||
+          map == roots.uncached_external_internalized_two_byte_string_map()) {
+        return SerializeObjectKey<ExternalTwoByteString, no_escaping>(
+            key, comma, no_gc);
+      }
+    }
+  }
+#else
+  InstanceType instance_type = key->map()->instance_type();
+  switch (instance_type) {
+    case INTERNALIZED_ONE_BYTE_STRING_TYPE:
+      V8_INLINE_STATEMENT return SerializeObjectKey<SeqOneByteString,
+                                                    no_escaping>(key, comma,
+                                                                 no_gc);
+    case EXTERNAL_INTERNALIZED_ONE_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_INTERNALIZED_ONE_BYTE_STRING_TYPE:
+      V8_INLINE_STATEMENT return SerializeObjectKey<ExternalOneByteString,
+                                                    no_escaping>(key, comma,
+                                                                 no_gc);
+    case INTERNALIZED_TWO_BYTE_STRING_TYPE:
+      return SerializeObjectKey<SeqTwoByteString, no_escaping>(key, comma,
+                                                               no_gc);
+    case EXTERNAL_INTERNALIZED_TWO_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_INTERNALIZED_TWO_BYTE_STRING_TYPE:
+      return SerializeObjectKey<ExternalTwoByteString, no_escaping>(key, comma,
+                                                                    no_gc);
+    default:
+      UNREACHABLE();
+  }
+#endif
+  UNREACHABLE();
+}
+
+template <typename Char>
+template <typename StringT, bool no_escaping>
+FastRdnStringifierObjectKeyResult
+FastRdnStringifier<Char>::SerializeObjectKey(
+    Tagged<String> obj, bool comma, const DisallowGarbageCollection& no_gc) {
+  using StringChar = StringT::Char;
+  if constexpr (is_one_byte && sizeof(StringChar) == 2) {
+    if constexpr (no_escaping) {
+      UNREACHABLE();
+    } else {
+      return FastRdnStringifierObjectKeyResult::kChangeEncoding;
+    }
+  } else {
+    Tagged<StringT> string = Cast<StringT>(obj);
+    const StringChar* chars;
+    if constexpr (requires { string->GetChars(no_gc); }) {
+      chars = string->GetChars(no_gc);
+    } else {
+      chars = string->GetChars();
+    }
+    const uint32_t length = string->length();
+    size_t max_length;
+    if constexpr (no_escaping) {
+      max_length = length;
+    } else {
+      max_length = RdnMaxEscapedStringLength(length);
+    }
+    max_length += 4;
+    EnsureCapacity(max_length);
+    SeparatorUnchecked(comma);
+    AppendCharacterUnchecked('"');
+    FastRdnStringifierObjectKeyResult result;
+    if constexpr (no_escaping) {
+      DCHECK(RdnIsFastKey(obj, no_gc));
+      AppendStringNoEscapes(chars, length, no_gc);
+      result = FastRdnStringifierObjectKeyResult::kSuccess;
+    } else {
+      bool needs_escaping = AppendString(chars, length, no_gc);
+      result = sizeof(StringChar) == 1 && !needs_escaping
+                   ? FastRdnStringifierObjectKeyResult::kSuccess
+                   : FastRdnStringifierObjectKeyResult::kSlow;
+    }
+    AppendCharacterUnchecked('"');
+    AppendCharacterUnchecked(':');
+    return result;
+  }
+}
+
+// ── String value serialization ──
+
+template <typename Char>
+template <typename StringT>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeString(
+    Tagged<HeapObject> obj, const DisallowGarbageCollection& no_gc) {
+  using StringChar = StringT::Char;
+  if constexpr (is_one_byte && sizeof(StringChar) == 2) {
+    return CHANGE_ENCODING;
+  } else {
+    Tagged<StringT> string = Cast<StringT>(obj);
+    const StringChar* chars;
+    if constexpr (requires { string->GetChars(no_gc); }) {
+      chars = string->GetChars(no_gc);
+    } else {
+      chars = string->GetChars();
+    }
+    const uint32_t length = string->length();
+    EnsureCapacity(RdnMaxEscapedStringLength(length) + 2);
+    AppendCharacterUnchecked('"');
+    AppendString(chars, length, no_gc);
+    AppendCharacterUnchecked('"');
+    return SUCCESS;
+  }
+}
+
+// ── Type dispatch ──
+
+template <typename Char>
+FastRdnStringifierResult FastRdnStringifier<Char>::TrySerializeSimpleObject(
+    Tagged<JSAny> object) {
+  DisallowGarbageCollection no_gc;
+  DisableGCMole no_gc_mole;
+  if (IsSmi(object)) {
+    SerializeSmi(Cast<Smi>(object));
+    return SUCCESS;
+  }
+  Tagged<HeapObject> obj = Cast<HeapObject>(object);
+  Tagged<Map> map = obj->map();
+  InstanceType instance_type = map->instance_type();
+  switch (instance_type) {
+    case INTERNALIZED_ONE_BYTE_STRING_TYPE:
+    case SEQ_ONE_BYTE_STRING_TYPE:
+      return SerializeString<SeqOneByteString>(obj, no_gc);
+    case EXTERNAL_INTERNALIZED_ONE_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_INTERNALIZED_ONE_BYTE_STRING_TYPE:
+    case EXTERNAL_ONE_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE:
+      return SerializeString<ExternalOneByteString>(obj, no_gc);
+    case THIN_ONE_BYTE_STRING_TYPE: {
+      Tagged<String> actual = Cast<ThinString>(obj)->actual();
+      if (IsExternalString(actual)) {
+        return SerializeString<ExternalOneByteString>(actual, no_gc);
+      } else {
+        return SerializeString<SeqOneByteString>(actual, no_gc);
+      }
+    }
+    case INTERNALIZED_TWO_BYTE_STRING_TYPE:
+    case SEQ_TWO_BYTE_STRING_TYPE:
+      return SerializeString<SeqTwoByteString>(obj, no_gc);
+    case EXTERNAL_INTERNALIZED_TWO_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_INTERNALIZED_TWO_BYTE_STRING_TYPE:
+    case EXTERNAL_TWO_BYTE_STRING_TYPE:
+    case UNCACHED_EXTERNAL_TWO_BYTE_STRING_TYPE:
+      return SerializeString<ExternalTwoByteString>(obj, no_gc);
+    case THIN_TWO_BYTE_STRING_TYPE: {
+      if constexpr (is_one_byte) {
+        return CHANGE_ENCODING;
+      } else {
+        Tagged<String> actual = Cast<ThinString>(obj)->actual();
+        if (IsExternalString(actual)) {
+          return SerializeString<ExternalTwoByteString>(actual, no_gc);
+        } else {
+          return SerializeString<SeqTwoByteString>(actual, no_gc);
+        }
+      }
+    }
+    case HEAP_NUMBER_TYPE:
+      SerializeDouble(Cast<HeapNumber>(obj)->value());
+      return SUCCESS;
+    case ODDBALL_TYPE:
+      switch (Cast<Oddball>(obj)->kind()) {
+        case Oddball::kFalse:
+          AppendCStringLiteral("false");
+          return SUCCESS;
+        case Oddball::kTrue:
+          AppendCStringLiteral("true");
+          return SUCCESS;
+        case Oddball::kNull:
+          AppendCStringLiteral("null");
+          return SUCCESS;
+        default:
+          return UNDEFINED;
+      }
+    case SYMBOL_TYPE:
+      return UNDEFINED;
+    case JS_DATE_TYPE:
+      // RDN: Inline GC-free date serialization.
+      SerializeDate(Cast<JSDate>(obj));
+      return SUCCESS;
+    case JS_FUNCTION_TYPE:
+      // RDN: Functions are skipped (like undefined).
+      return UNDEFINED;
+    case JS_OBJECT_TYPE:
+      return JS_OBJECT;
+    case JS_ARRAY_TYPE:
+      return JS_ARRAY;
+    default:
+      // BigInt, Map, Set, RegExp, TypedArray, TimeOnly, Duration, etc.
+      return SLOW_PATH;
+  }
+  UNREACHABLE();
+}
+
+// ── JSObject serialization ──
+
+template <typename Char>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeJSObject(
+    Tagged<JSObject> obj, const DisallowGarbageCollection& no_gc) {
+  Tagged<Map> map = obj->map();
+  if (V8_UNLIKELY(!CanFastSerializeRdnJSObjectFastPath(
+          obj, initial_jsobject_proto_, map, isolate_))) {
+    return SLOW_PATH;
+  }
+  AppendCharacter('{');
+  const uint16_t nof_descriptors = map->NumberOfOwnDescriptors();
+  const uint8_t in_object_properties = map->GetInObjectProperties();
+  const uint8_t in_object_properties_start =
+      map->GetInObjectPropertiesStartInWords();
+  const Tagged<DescriptorArray> descriptors = map->instance_descriptors();
+  FastIterableState fast_iterable_state = descriptors->fast_iterable();
+  switch (fast_iterable_state) {
+#define CASE(state)                                    \
+  case FastIterableState::state:                       \
+    return ResumeJSObject<FastIterableState::state>(   \
+        obj, 0, nof_descriptors, in_object_properties, \
+        in_object_properties_start, descriptors, false, no_gc)
+    CASE(kUnknown);
+    CASE(kJsonFast);
+    CASE(kJsonSlow);
+#undef CASE
+  }
+  UNREACHABLE();
+}
+
+template <typename Char>
+template <DescriptorArray::FastIterableState fast_iterable_state>
+FastRdnStringifierResult FastRdnStringifier<Char>::ResumeJSObject(
+    Tagged<JSObject> obj, uint16_t start_descriptor_idx,
+    uint16_t nof_descriptors, uint8_t in_object_properties,
+    uint8_t in_object_properties_start, Tagged<DescriptorArray> descriptors,
+    bool comma, const DisallowGarbageCollection& no_gc) {
+  PtrComprCageBase cage_base = GetPtrComprCageBase();
+  InternalIndex::Range range{start_descriptor_idx, nof_descriptors};
+  for (InternalIndex i : range) {
+    static_assert(kMaxNumberOfDescriptors <
+                  std::numeric_limits<uint16_t>::max());
+    DCHECK_LE(i.as_uint32(), kMaxNumberOfDescriptors);
+    const uint16_t descriptor_idx = static_cast<uint16_t>(i.as_uint32());
+    Tagged<Name> name = descriptors->GetKey(i);
+    int property_index;
+    if constexpr (fast_iterable_state != FastIterableState::kJsonFast) {
+      if (V8_UNLIKELY(IsSymbol(name))) {
+        if constexpr (fast_iterable_state == FastIterableState::kUnknown) {
+          descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+        }
+        continue;
+      }
+      PropertyDetails details = descriptors->GetDetails(i);
+      // RDN: DontEnum descriptors may indicate TimeOnly/Duration.
+      // Bail to slow path for correct serialization.
+      if (V8_UNLIKELY(details.IsDontEnum())) {
+        if constexpr (fast_iterable_state == FastIterableState::kUnknown) {
+          descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+        }
+        return SLOW_PATH;
+      }
+      if (V8_UNLIKELY(details.location() != PropertyLocation::kField)) {
+        descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+        return SLOW_PATH;
+      }
+      DCHECK_EQ(PropertyKind::kData, details.kind());
+      property_index = details.field_index();
+    } else {
+      DCHECK_EQ(descriptor_idx, descriptors->GetDetails(i).field_index());
+      property_index = descriptor_idx;
+    }
+    const bool is_inobject = property_index < in_object_properties;
+    Tagged<JSAny> property;
+    if (is_inobject) {
+      int offset = (in_object_properties_start + property_index) * kTaggedSize;
+      property = TaggedField<JSAny>::Relaxed_Load(cage_base, obj, offset);
+    } else {
+      property_index -= in_object_properties;
+      property = obj->property_array(cage_base)->get(cage_base, property_index);
+    }
+    DCHECK(IsInternalizedString(name));
+    Tagged<String> key_name = Cast<String>(name);
+    if (V8_UNLIKELY(IsUndefined(property) || IsSymbol(property) ||
+                    IsJSFunction(property))) {
+      if constexpr (fast_iterable_state == FastIterableState::kUnknown) {
+        if (!RdnIsFastKey(key_name, no_gc)) {
+          descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+        }
+      }
+      continue;
+    }
+    FastRdnStringifierObjectKeyResult key_result;
+    if constexpr (fast_iterable_state == FastIterableState::kJsonFast) {
+      V8_INLINE_STATEMENT key_result =
+          SerializeObjectKey<true>(key_name, comma, no_gc);
+      DCHECK_EQ(key_result, FastRdnStringifierObjectKeyResult::kSuccess);
+    } else {
+      key_result = SerializeObjectKey<false>(key_name, comma, no_gc);
+      if (V8_UNLIKELY(key_result !=
+                      FastRdnStringifierObjectKeyResult::kSuccess)) {
+        descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+        if constexpr (is_one_byte) {
+          if (key_result ==
+              FastRdnStringifierObjectKeyResult::kChangeEncoding) {
+            stack_.emplace_back(
+                RdnContinuationRecord::
+                    ForJSObjectResume<fast_iterable_state>(
+                        obj, descriptor_idx + 1, nof_descriptors,
+                        in_object_properties, in_object_properties_start,
+                        descriptors));
+            if (IsJSObject(property)) {
+              stack_.emplace_back(
+                  RdnContinuationRecord::ForJSObject(property));
+            } else if (IsJSArray(property)) {
+              stack_.emplace_back(
+                  RdnContinuationRecord::ForJSArray(property));
+            } else {
+              stack_.emplace_back(
+                  RdnContinuationRecord::ForSimpleObject(property));
+            }
+            stack_.emplace_back(
+                RdnContinuationRecord::ForObjectKey(key_name, comma));
+            return CHANGE_ENCODING;
+          }
+        } else {
+          DCHECK_NE(key_result,
+                    FastRdnStringifierObjectKeyResult::kChangeEncoding);
+        }
+      }
+    }
+    DisableGCMole no_gc_mole;
+    FastRdnStringifierResult result;
+    if constexpr (fast_iterable_state == FastIterableState::kJsonFast) {
+      V8_INLINE_STATEMENT result = TrySerializeSimpleObject(property);
+    } else {
+      result = TrySerializeSimpleObject(property);
+    }
+    switch (result) {
+      case SUCCESS:
+        comma = true;
+        break;
+      case UNDEFINED:
+        break;
+      case JS_OBJECT:
+      case JS_ARRAY:
+        stack_.push_back(
+            RdnContinuationRecord::ForJSObjectResume<fast_iterable_state>(
+                obj, descriptor_idx + 1, nof_descriptors, in_object_properties,
+                in_object_properties_start, descriptors));
+        stack_.push_back(RdnContinuationRecord::ForJSAny(property, result));
+        return result;
+      case CHANGE_ENCODING:
+        if constexpr (is_one_byte) {
+          stack_.push_back(
+              RdnContinuationRecord::ForJSObjectResume<fast_iterable_state>(
+                  obj, descriptor_idx + 1, nof_descriptors,
+                  in_object_properties, in_object_properties_start,
+                  descriptors));
+          stack_.push_back(RdnContinuationRecord::ForSimpleObject(property));
+          return result;
+        } else {
+          UNREACHABLE();
+        }
+      case SLOW_PATH:
+      case EXCEPTION:
+        return result;
+    }
+  }
+  AppendCharacter('}');
+  if constexpr (fast_iterable_state == FastIterableState::kUnknown) {
+    if (nof_descriptors == descriptors->number_of_descriptors()) {
+      descriptors->set_fast_iterable_if(FastIterableState::kJsonFast,
+                                        FastIterableState::kUnknown);
+    }
+  }
+  return SUCCESS;
+}
+
+// ── JSArray serialization ──
+
+template <typename Char>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeJSArray(
+    Tagged<JSArray> array) {
+  if (V8_UNLIKELY(!CanFastSerializeRdnJSArrayFastPath(
+          array, initial_jsarray_proto_, isolate_))) {
+    return SLOW_PATH;
+  }
+  AppendCharacter('[');
+  uint32_t length = static_cast<uint32_t>(Object::NumberValue(array->length()));
+  Tagged<FixedArrayBase> elements = array->elements();
+  switch (array->GetElementsKind()) {
+#define CASE(kind)                                                             \
+  case kind:                                                                   \
+    if constexpr (IsHoleyElementsKind(kind)) {                                 \
+      if (V8_UNLIKELY(!Protectors::IsNoElementsIntact(isolate_))) {            \
+        return SLOW_PATH;                                                      \
+      }                                                                        \
+    }                                                                          \
+    if (V8_UNLIKELY(length > kArrayInterruptLength)) {                         \
+      return SerializeFixedArrayWithInterruptCheck<kind>(elements, 0, length); \
+    } else {                                                                   \
+      return SerializeFixedArray<kind>(elements, 0, length);                   \
+    }
+    CASE(PACKED_SMI_ELEMENTS)
+    CASE(PACKED_ELEMENTS)
+    CASE(PACKED_DOUBLE_ELEMENTS)
+    CASE(HOLEY_SMI_ELEMENTS)
+    CASE(HOLEY_ELEMENTS)
+    CASE(HOLEY_DOUBLE_ELEMENTS)
+#undef CASE
+    default:
+      return SLOW_PATH;
+  }
+  UNREACHABLE();
+}
+
+template <typename Char>
+template <ElementsKind kind>
+FastRdnStringifierResult
+FastRdnStringifier<Char>::SerializeFixedArrayWithInterruptCheck(
+    Tagged<FixedArrayBase> elements, uint32_t start_index, uint32_t length) {
+  using ArrayT = std::conditional_t<IsDoubleElementsKind(kind),
+                                    FixedDoubleArray, FixedArray>;
+  StackLimitCheck interrupt_check(isolate_);
+  uint32_t limit = std::min(length, start_index + kArrayInterruptLength);
+  constexpr uint32_t kMaxAllowedFastPackedLength =
+      std::numeric_limits<uint32_t>::max() - kArrayInterruptLength;
+  static_assert(FixedArray::kMaxLength < kMaxAllowedFastPackedLength);
+  DisableGCMole no_gc_mole;
+  uint32_t i = start_index;
+  while (true) {
+    for (; i < limit; i++) {
+      FastRdnStringifierResult result =
+          SerializeFixedArrayElement<kind, true>(
+              Cast<ArrayT>(elements), i, length);
+      if (result != SUCCESS) return result;
+    }
+    if (i >= length) {
+      AppendCharacter(']');
+      return SUCCESS;
+    }
+    DCHECK_LT(limit, kMaxAllowedFastPackedLength);
+    limit = std::min(length, limit + kArrayInterruptLength);
+    {
+      AllowGarbageCollection allow_gc;
+      if (interrupt_check.InterruptRequested() &&
+          IsExceptionHole(isolate_->stack_guard()->HandleInterrupts(
+                              StackGuard::InterruptLevel::kNoGC),
+                          isolate_)) {
+        return EXCEPTION;
+      }
+    }
+  }
+  UNREACHABLE();
+}
+
+template <typename Char>
+template <ElementsKind kind>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeFixedArray(
+    Tagged<FixedArrayBase> elements, uint32_t start_index, uint32_t length) {
+  using ArrayT = std::conditional_t<IsDoubleElementsKind(kind),
+                                    FixedDoubleArray, FixedArray>;
+  for (uint32_t i = start_index; i < length; i++) {
+    FastRdnStringifierResult result =
+        SerializeFixedArrayElement<kind, false>(
+            Cast<ArrayT>(elements), i, length);
+    if (result != SUCCESS) return result;
+  }
+  AppendCharacter(']');
+  return SUCCESS;
+}
+
+template <typename Char>
+template <ElementsKind kind, bool with_interrupt_checks, typename T>
+FastRdnStringifierResult
+FastRdnStringifier<Char>::SerializeFixedArrayElement(
+    Tagged<T> elements, uint32_t i, uint32_t length) {
+  if constexpr (IsHoleyElementsKind(kind)) {
+    if (elements->is_the_hole(isolate_, i)) {
+      EnsureCapacity(5);
+      SeparatorUnchecked(i > 0);
+      AppendCStringLiteralUnchecked("null");
+      return SUCCESS;
+    }
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
+    if constexpr (IsDoubleElementsKind(kind)) {
+      if (elements->is_undefined(i)) {
+        EnsureCapacity(5);
+        SeparatorUnchecked(i > 0);
+        AppendCStringLiteralUnchecked("null");
+        return SUCCESS;
+      }
+    }
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
+  }
+  DCHECK(!elements->is_the_hole(isolate_, i));
+  Separator(i > 0);
+  if constexpr (IsSmiElementsKind(kind)) {
+    SerializeSmi(Cast<Smi>(elements->get(i)));
+  } else if constexpr (IsDoubleElementsKind(kind)) {
+    SerializeDouble(elements->get_scalar(i));
+  } else {
+    Tagged<JSAny> obj = Cast<JSAny>(elements->get(i));
+    DisableGCMole no_gc_mole;
+    FastRdnStringifierResult result;
+    V8_INLINE_STATEMENT result = TrySerializeSimpleObject(obj);
+    switch (result) {
+      case UNDEFINED:
+        AppendCStringLiteral("null");
+        return SUCCESS;
+      case CHANGE_ENCODING:
+        if constexpr (is_one_byte) {
+          DCHECK(IsString(obj));
+          stack_.push_back(
+              RdnContinuationRecord::
+                  ForJSArrayResume<kind, with_interrupt_checks>(
+                      elements, i + 1, length));
+          stack_.push_back(RdnContinuationRecord::ForSimpleObject(obj));
+          return result;
+        } else {
+          UNREACHABLE();
+        }
+      case JS_OBJECT:
+      case JS_ARRAY:
+        stack_.push_back(
+            RdnContinuationRecord::
+                ForJSArrayResume<kind, with_interrupt_checks>(
+                    elements, i + 1, length));
+        stack_.push_back(RdnContinuationRecord::ForJSAny(obj, result));
+        return result;
+      case SUCCESS:
+      case SLOW_PATH:
+      case EXCEPTION:
+        return result;
+    }
+    UNREACHABLE();
+  }
+  return SUCCESS;
+}
+
+// ── Interrupt + cycle detection ──
+
+template <typename Char>
+FastRdnStringifierResult
+FastRdnStringifier<Char>::HandleInterruptAndCheckCycle() {
+  StackLimitCheck interrupt_check(isolate_);
+  {
+    AllowGarbageCollection allow_gc;
+    if (V8_UNLIKELY(interrupt_check.InterruptRequested() &&
+                    IsExceptionHole(isolate_->stack_guard()->HandleInterrupts(
+                                        StackGuard::InterruptLevel::kNoGC),
+                                    isolate_))) {
+      return EXCEPTION;
+    }
+  }
+  if (V8_UNLIKELY(CheckCycle())) {
+    return SLOW_PATH;
+  }
+  return SUCCESS;
+}
+
+template <typename Char>
+bool FastRdnStringifier<Char>::CheckCycle() {
+  std::unordered_set<Address> set;
+  for (uint32_t i = 0; i < stack_.size(); i++) {
+    RdnContinuationRecord rec = stack_[i];
+    if (rec.type() == RdnContinuationRecord::kObjectKey ||
+        rec.type() == RdnContinuationRecord::kSimpleObject)
+      continue;
+    Tagged<Object> obj = rec.object();
+    if (V8_UNLIKELY(set.find(obj.ptr()) != set.end())) {
+      return true;
+    }
+    set.insert(obj.ptr());
+  }
+  return false;
+}
+
+// ── Main entry + continuation loop ──
+
+template <typename Char>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeObject(
+    Tagged<JSAny> object, const DisallowGarbageCollection& no_gc) {
+  // RDN: No toJSON checks. Only cache prototypes for cross-context safety.
+  if (!object.IsSmi() && (IsJSObject(object) || IsJSArray(object))) {
+    Tagged<HeapObject> obj = Cast<HeapObject>(object);
+    Tagged<Map> meta_map = obj->map()->map();
+    if (V8_UNLIKELY(meta_map == ReadOnlyRoots(isolate_).meta_map())) {
+      return SLOW_PATH;
+    }
+    Tagged<NativeContext> native_context = meta_map->native_context();
+    initial_jsobject_proto_ = native_context->initial_object_prototype();
+    initial_jsarray_proto_ = native_context->initial_array_prototype();
+    Tagged<HeapObject> jsarray_proto_proto =
+        initial_jsarray_proto_->map()->prototype();
+    if (V8_UNLIKELY(jsarray_proto_proto != initial_jsobject_proto_)) {
+      return SLOW_PATH;
+    }
+  }
+  DisableGCMole no_gc_mole;
+  FastRdnStringifierResult result = TrySerializeSimpleObject(object);
+  if constexpr (is_one_byte) {
+    if (V8_UNLIKELY(result == CHANGE_ENCODING)) {
+      DCHECK(IsString(object));
+      stack_.push_back(RdnContinuationRecord::ForSimpleObject(object));
+      return result;
+    }
+  } else {
+    DCHECK_NE(result, CHANGE_ENCODING);
+  }
+  if (result != JS_OBJECT && result != JS_ARRAY) {
+    return result;
+  }
+  return SerializeObject(RdnContinuationRecord::ForJSAny(object, result),
+                         no_gc);
+}
+
+template <typename Char>
+FastRdnStringifierResult FastRdnStringifier<Char>::SerializeObject(
+    RdnContinuationRecord cont, const DisallowGarbageCollection& no_gc) {
+  DisableGCMole no_gc_mole;
+  uint32_t interrupt_budget = kGlobalInterruptBudget;
+  FastRdnStringifierResult result;
+  while (true) {
+    --interrupt_budget;
+    if (V8_UNLIKELY(interrupt_budget == 0)) {
+      result = HandleInterruptAndCheckCycle();
+      if (V8_UNLIKELY(result != SUCCESS)) return result;
+      interrupt_budget = kGlobalInterruptBudget;
+    }
+    switch (cont.type()) {
+      case RdnContinuationRecord::kObject:
+        result = SerializeJSObject(cont.js_object(), no_gc);
+        break;
+      case RdnContinuationRecord::kObjectResume_Uninitialized:
+        result = ResumeJSObject<FastIterableState::kUnknown>(
+            cont.js_object(), cont.object_descriptor_idx(),
+            cont.object_nof_descriptors(), cont.object_in_object_properties(),
+            cont.object_in_object_properties_start(),
+            cont.object_descriptors(), true, no_gc);
+        break;
+      case RdnContinuationRecord::kObjectResume_FastIterable:
+        result = ResumeJSObject<FastIterableState::kJsonFast>(
+            cont.js_object(), cont.object_descriptor_idx(),
+            cont.object_nof_descriptors(), cont.object_in_object_properties(),
+            cont.object_in_object_properties_start(),
+            cont.object_descriptors(), true, no_gc);
+        break;
+      case RdnContinuationRecord::kObjectResume_SlowIterable:
+        result = ResumeJSObject<FastIterableState::kJsonSlow>(
+            cont.js_object(), cont.object_descriptor_idx(),
+            cont.object_nof_descriptors(), cont.object_in_object_properties(),
+            cont.object_in_object_properties_start(),
+            cont.object_descriptors(), true, no_gc);
+        break;
+      case RdnContinuationRecord::kArray:
+        result = SerializeJSArray(cont.js_array());
+        break;
+      case RdnContinuationRecord::kArrayResume:
+        result = SerializeFixedArray<PACKED_ELEMENTS>(
+            cont.array_elements(), cont.array_index(), cont.array_length());
+        break;
+      case RdnContinuationRecord::kArrayResume_Holey:
+        result = SerializeFixedArray<HOLEY_ELEMENTS>(
+            cont.array_elements(), cont.array_index(), cont.array_length());
+        break;
+      case RdnContinuationRecord::kArrayResume_WithInterrupts:
+        result = SerializeFixedArrayWithInterruptCheck<PACKED_ELEMENTS>(
+            cont.array_elements(), cont.array_index(), cont.array_length());
+        break;
+      case RdnContinuationRecord::kArrayResume_Holey_WithInterrupts:
+        result = SerializeFixedArrayWithInterruptCheck<HOLEY_ELEMENTS>(
+            cont.array_elements(), cont.array_index(), cont.array_length());
+        break;
+      default:
+        UNREACHABLE();
+    }
+    static_assert(SUCCESS == 0);
+    static_assert(JS_OBJECT == 1);
+    static_assert(JS_ARRAY == 2);
+    if (V8_UNLIKELY(result > JS_ARRAY)) return result;
+    if (stack_.empty()) return SUCCESS;
+    cont = stack_.back();
+    stack_.pop_back();
+  }
+}
+
+// ── ResumeFrom (encoding transition) ──
+
+template <typename Char>
+template <typename OldChar>
+  requires(sizeof(OldChar) < sizeof(Char))
+FastRdnStringifierResult FastRdnStringifier<Char>::ResumeFrom(
+    FastRdnStringifier<OldChar>& old_stringifier,
+    const DisallowGarbageCollection& no_gc) {
+  DCHECK_EQ(ResultLength(), 0);
+  DCHECK(stack_.empty());
+  DCHECK(!old_stringifier.stack_.empty());
+  initial_jsobject_proto_ = old_stringifier.initial_jsobject_proto_;
+  initial_jsarray_proto_ = old_stringifier.initial_jsarray_proto_;
+  stack_ = old_stringifier.stack_;
+  RdnContinuationRecord cont = stack_.back();
+  stack_.pop_back();
+  if (cont.type() == RdnContinuationRecord::kObjectKey) {
+    FastRdnStringifierObjectKeyResult key_result = SerializeObjectKey<false>(
+        cont.object_key(), cont.object_key_comma(), no_gc);
+    USE(key_result);
+    DCHECK_NE(key_result, FastRdnStringifierObjectKeyResult::kChangeEncoding);
+    DCHECK_GE(stack_.size(), 2);
+    cont = stack_.back();
+    stack_.pop_back();
+    DCHECK(RdnContinuationRecord::IsObjectResumeType(stack_.back().type()));
+  }
+  if (cont.type() == RdnContinuationRecord::kSimpleObject) {
+    DisableGCMole no_gc_mole;
+    FastRdnStringifierResult result =
+        TrySerializeSimpleObject(cont.simple_object());
+    if (V8_UNLIKELY(result != SUCCESS)) {
+      DCHECK_EQ(result, SLOW_PATH);
+      return result;
+    }
+    if (stack_.empty()) return result;
+    cont = stack_.back();
+    stack_.pop_back();
+  }
+  DCHECK(cont.type() != RdnContinuationRecord::kSimpleObject &&
+         cont.type() != RdnContinuationRecord::kObjectKey);
+  return SerializeObject(cont, no_gc);
+}
+
+// ── FastRdnStringify wrapper ──
+
+MaybeHandle<Object> FastRdnStringify(Isolate* isolate,
+                                     Handle<Object> object) {
+  if (IsUndefined(*object, isolate) || IsJSFunction(*object) ||
+      IsSymbol(*object)) {
+    return isolate->factory()->undefined_value();
+  }
+  DisallowGarbageCollection no_gc;
+  FastRdnStringifier<uint8_t> one_byte(isolate);
+  std::optional<FastRdnStringifier<base::uc16>> two_byte;
+  FastRdnStringifierResult result =
+      one_byte.SerializeObject(Cast<JSAny>(*object), no_gc);
+  bool result_is_one_byte = true;
+  if (result == CHANGE_ENCODING) {
+    two_byte.emplace(isolate);
+    result = two_byte->ResumeFrom(one_byte, no_gc);
+    DCHECK_NE(result, CHANGE_ENCODING);
+    result_is_one_byte = false;
+  }
+  if (V8_LIKELY(result == SUCCESS)) {
+    if (result_is_one_byte) {
+      const size_t length = one_byte.ResultLength();
+      Handle<SeqOneByteString> ret;
+      {
+        AllowGarbageCollection allow_gc;
+        if (length > String::kMaxLength) {
+          THROW_NEW_ERROR(isolate, NewInvalidStringLengthError());
+        }
+        ASSIGN_RETURN_ON_EXCEPTION(
+            isolate, ret,
+            isolate->factory()->NewRawOneByteString(
+                static_cast<int>(length)));
+      }
+      one_byte.CopyResultTo(ret->GetChars(no_gc));
+      return ret;
+    } else {
+      DCHECK(two_byte.has_value());
+      const size_t one_byte_len = one_byte.ResultLength();
+      const size_t two_byte_len = two_byte->ResultLength();
+      const size_t total = one_byte_len + two_byte_len;
+      Handle<SeqTwoByteString> ret;
+      {
+        AllowGarbageCollection allow_gc;
+        if (total > String::kMaxLength) {
+          THROW_NEW_ERROR(isolate, NewInvalidStringLengthError());
+        }
+        ASSIGN_RETURN_ON_EXCEPTION(
+            isolate, ret,
+            isolate->factory()->NewRawTwoByteString(
+                static_cast<int>(total)));
+      }
+      base::uc16* chars = ret->GetChars(no_gc);
+      if (one_byte_len > 0) one_byte.CopyResultTo(chars);
+      DCHECK_GT(two_byte_len, 0);
+      two_byte->CopyResultTo(chars + one_byte_len);
+      return ret;
+    }
+  } else if (result == UNDEFINED) {
+    return isolate->factory()->undefined_value();
+  } else if (result == SLOW_PATH) {
+    AllowGarbageCollection allow_gc;
+    RdnStringifier stringifier(isolate);
+    return stringifier.Stringify(object);
+  }
+  DCHECK(result == EXCEPTION);
+  CHECK(isolate->has_exception());
+  return MaybeHandle<Object>();
+}
+
 }  // namespace
 
 // ── Public entry point ────────────────────────────────────────────
 
 MaybeHandle<Object> RdnStringify(Isolate* isolate, Handle<Object> object) {
+  if (v8_flags.rdn_stringify_fast_path) {
+    return FastRdnStringify(isolate, object);
+  }
   RdnStringifier stringifier(isolate);
   return stringifier.Stringify(object);
 }
