@@ -35,7 +35,11 @@
 #include "src/objects/ordered-hash-table.h"
 #include "src/objects/string.h"
 #include "src/objects/descriptor-array-inl.h"
+#include "src/objects/field-type.h"
+#include "src/objects/map-updater.h"
+#include "src/objects/transitions.h"
 #include "src/strings/char-predicates-inl.h"
+#include "src/utils/boxed-float.h"
 
 namespace v8 {
 namespace internal {
@@ -222,7 +226,536 @@ const uint8_t* GetFastKeyChars(Isolate* isolate, Tagged<String> key,
 #endif
 }
 
+// ── Folded mutable HeapNumber helpers ──────────────────────────────
+// Copied from json-parser.cc:696-762 to avoid modifying upstream code.
+
+class FoldedMutableHeapNumberAllocation {
+ public:
+  static_assert(!USE_ALLOCATION_ALIGNMENT_HEAP_NUMBER_BOOL);
+
+  FoldedMutableHeapNumberAllocation(Isolate* isolate, int count) {
+    if (count == 0) return;
+    int size = count * sizeof(HeapNumber);
+    raw_bytes_ = isolate->factory()->NewByteArray(size);
+  }
+
+  Handle<ByteArray> raw_bytes() const { return raw_bytes_; }
+
+ private:
+  Handle<ByteArray> raw_bytes_ = {};
+};
+
+class FoldedMutableHeapNumberAllocator {
+ public:
+  FoldedMutableHeapNumberAllocator(
+      Isolate* isolate, FoldedMutableHeapNumberAllocation* allocation,
+      DisallowGarbageCollection& no_gc)
+      : isolate_(isolate), roots_(isolate) {
+    if (allocation->raw_bytes().is_null()) return;
+
+    raw_bytes_ = allocation->raw_bytes();
+    mutable_double_address_ =
+        reinterpret_cast<Address>(allocation->raw_bytes()->begin());
+  }
+
+  ~FoldedMutableHeapNumberAllocator() {
+    if (mutable_double_address_ == 0) {
+      DCHECK(raw_bytes_.is_null());
+      return;
+    }
+
+    DCHECK_EQ(mutable_double_address_,
+              reinterpret_cast<Address>(raw_bytes_->end()));
+    isolate_->heap()->EnsureSweepingCompletedForObject(*raw_bytes_);
+    raw_bytes_->set_length(0);
+  }
+
+  Tagged<HeapNumber> AllocateNext(ReadOnlyRoots roots, Float64 value) {
+    DCHECK_GE(mutable_double_address_,
+              reinterpret_cast<Address>(raw_bytes_->begin()));
+    Tagged<HeapObject> hn = HeapObject::FromAddress(mutable_double_address_);
+    hn->set_map_after_allocation(isolate_, roots.heap_number_map());
+    Cast<HeapNumber>(hn)->set_value_as_bits(value.get_bits());
+    mutable_double_address_ +=
+        ALIGN_TO_ALLOCATION_ALIGNMENT(sizeof(HeapNumber));
+    DCHECK_LE(mutable_double_address_,
+              reinterpret_cast<Address>(raw_bytes_->end()));
+    return Cast<HeapNumber>(hn);
+  }
+
+ private:
+  Isolate* isolate_;
+  ReadOnlyRoots roots_;
+  Handle<ByteArray> raw_bytes_ = {};
+  Address mutable_double_address_ = 0;
+};
+
+// ── RdnDataObjectBuilder ──────────────────────────────────────────
+// Copied from json-parser.cc:764-1271 (JSDataObjectBuilder), renamed to
+// avoid ODR conflicts. Builds data objects via pre-computed map transitions
+// and single-pass field writes — the key optimization for closing the
+// JSON.parse performance gap.
+class RdnDataObjectBuilder {
+ public:
+  enum HeapNumberMode {
+    kNormalHeapNumbers,
+    kHeapNumbersGuaranteedUniquelyOwned
+  };
+  RdnDataObjectBuilder(Isolate* isolate, ElementsKind elements_kind,
+                        int expected_named_properties,
+                        DirectHandle<Map> expected_final_map,
+                        HeapNumberMode heap_number_mode)
+      : isolate_(isolate),
+        elements_kind_(elements_kind),
+        expected_property_count_(expected_named_properties),
+        heap_number_mode_(heap_number_mode),
+        expected_final_map_(expected_final_map) {
+    if (!TryInitializeMapFromExpectedFinalMap()) {
+      InitializeMapFromZero();
+    }
+  }
+
+  template <typename PropertyIterator>
+  Handle<JSObject> BuildFromIterator(
+      PropertyIterator&& it, MaybeHandle<FixedArrayBase> maybe_elements = {}) {
+    Handle<String> failed_property_add_key;
+    for (; !it.Done(); it.Advance()) {
+      Handle<String> property_key;
+      if (!TryAddFastPropertyForValue(
+              it.GetKeyChars(),
+              [&](Handle<String> expected_key) {
+                return property_key = it.GetKey(expected_key);
+              },
+              [&]() { return it.GetValue(true); })) {
+        failed_property_add_key = property_key;
+        break;
+      }
+    }
+
+    DirectHandle<FixedArrayBase> elements;
+    if (!maybe_elements.ToHandle(&elements)) {
+      elements = isolate_->factory()->empty_fixed_array();
+    }
+    CreateAndInitialiseObject(it.RevisitValues(), elements);
+
+    for (; !it.Done(); it.Advance()) {
+      DirectHandle<String> key;
+      if (!failed_property_add_key.is_null()) {
+        key = std::exchange(failed_property_add_key, {});
+      } else {
+        key = it.GetKey({});
+      }
+#ifdef DEBUG
+      uint32_t index;
+      DCHECK(!key->AsArrayIndex(&index));
+#endif
+      Handle<Object> value = it.GetValue(false);
+      AddSlowProperty(key, value);
+    }
+
+    return object();
+  }
+
+  template <typename Char, typename GetKeyFunction, typename GetValueFunction>
+  V8_INLINE bool TryAddFastPropertyForValue(base::Vector<const Char> key_chars,
+                                            GetKeyFunction&& get_key,
+                                            GetValueFunction&& get_value) {
+    DCHECK(object_.is_null());
+
+    Handle<String> key;
+    bool existing_map_found =
+        TryFastTransitionToPropertyKey(key_chars, get_key, &key);
+    DirectHandle<Object> value = get_value();
+    if (existing_map_found) {
+      if (!TryGeneralizeFieldToValue(value)) {
+        return false;
+      }
+      AdvanceToNextProperty();
+      return true;
+    }
+
+    Tagged<DescriptorArray> descriptors = map_->instance_descriptors(isolate_);
+    InternalIndex descriptor_number =
+        descriptors->SearchWithCache(isolate_, *key, *map_);
+    if (descriptor_number.is_found()) {
+      return false;
+    }
+
+    if (!TransitionsAccessor::CanHaveMoreTransitions(isolate_, map_)) {
+      return false;
+    }
+
+    Representation representation =
+        Object::OptimalRepresentation(*value, isolate_);
+    DirectHandle<FieldType> type =
+        Object::OptimalType(*value, isolate_, representation);
+    MaybeHandle<Map> maybe_map = Map::CopyWithField(
+        isolate_, map_, key, type, NONE, PropertyConstness::kConst,
+        representation, INSERT_TRANSITION);
+    Handle<Map> next_map;
+    if (!maybe_map.ToHandle(&next_map)) return false;
+    if (next_map->is_dictionary_map()) return false;
+
+    map_ = next_map;
+    if (representation.IsDouble()) {
+      RegisterFieldNeedsFreshHeapNumber(value);
+    }
+    AdvanceToNextProperty();
+    return true;
+  }
+
+  template <typename ValueIterator>
+  V8_INLINE void CreateAndInitialiseObject(
+      ValueIterator value_it, DirectHandle<FixedArrayBase> elements) {
+    DCHECK(object_.is_null());
+
+    if (current_property_index_ < property_count_in_expected_final_map_) {
+      RewindExpectedFinalMapFastPathToBeforeCurrent();
+    }
+
+    if (map_->is_dictionary_map()) {
+      DCHECK_EQ(current_property_index_, 0);
+
+      Handle<JSObject> object = isolate_->factory()->NewSlowJSObjectFromMap(
+          map_, expected_property_count_);
+      object->set_elements(*elements);
+      object_ = object;
+      return;
+    }
+
+    DCHECK_EQ(current_property_index_, map_->NumberOfOwnDescriptors());
+    DCHECK_EQ(current_property_index_,
+              map_->GetInObjectProperties() - map_->UnusedInObjectProperties());
+
+    FoldedMutableHeapNumberAllocation hn_allocation(isolate_,
+                                                    extra_heap_numbers_needed_);
+
+    Handle<JSObject> object = isolate_->factory()->NewJSObjectFromMap(
+        map_, AllocationType::kYoung, DirectHandle<AllocationSite>::null(),
+        NewJSObjectType::kNoEmbedderFieldsAndNoApiWrapper);
+    DisallowGarbageCollection no_gc;
+    Tagged<JSObject> raw_object = *object;
+
+    raw_object->set_elements(*elements);
+    Tagged<DescriptorArray> descriptors =
+        raw_object->map()->instance_descriptors();
+
+    FoldedMutableHeapNumberAllocator hn_allocator(isolate_, &hn_allocation,
+                                                  no_gc);
+
+    ReadOnlyRoots roots(isolate_);
+
+    int current_property_offset = raw_object->GetInObjectPropertyOffset(0);
+    for (int i = 0; i < current_property_index_; ++i, ++value_it) {
+      InternalIndex descriptor_index(i);
+      Tagged<Object> value = **value_it;
+
+      if (heap_number_mode_ != kHeapNumbersGuaranteedUniquelyOwned ||
+          IsSmi(value)) {
+        PropertyDetails details = descriptors->GetDetails(descriptor_index);
+        if (details.representation().IsDouble()) {
+          value = hn_allocator.AllocateNext(
+              roots, Float64(Object::NumberValue(value)));
+        }
+      }
+
+      DCHECK(FieldIndex::ForPropertyIndex(object->map(), i).is_inobject());
+      DCHECK_EQ(current_property_offset,
+                FieldIndex::ForPropertyIndex(object->map(), i).offset());
+      DCHECK_EQ(current_property_offset,
+                object->map()->GetInObjectPropertyOffset(i));
+      FieldIndex index = FieldIndex::ForInObjectOffset(current_property_offset,
+                                                       FieldIndex::kTagged);
+      raw_object->RawFastInobjectPropertyAtPut(index, value,
+                                               SKIP_WRITE_BARRIER);
+      current_property_offset += kTaggedSize;
+    }
+    DCHECK_EQ(current_property_offset, object->map()->GetInObjectPropertyOffset(
+                                           current_property_index_));
+
+    object_ = object;
+  }
+
+  void AddSlowProperty(DirectHandle<String> key, Handle<Object> value) {
+    DCHECK(!object_.is_null());
+
+    LookupIterator it(isolate_, object_, key, object_, LookupIterator::OWN);
+    JSObject::DefineOwnPropertyIgnoreAttributes(&it, value, NONE).Check();
+  }
+
+  Handle<JSObject> object() {
+    DCHECK(!object_.is_null());
+    return object_;
+  }
+
+ private:
+  template <typename Char, typename GetKeyFunction>
+  V8_INLINE bool TryFastTransitionToPropertyKey(
+      base::Vector<const Char> key_chars, GetKeyFunction&& get_key,
+      Handle<String>* key_out) {
+    Handle<String> expected_key;
+    DirectHandle<Map> target_map;
+
+    InternalIndex descriptor_index(current_property_index_);
+    if (IsOnExpectedFinalMapFastPath()) {
+      expected_key = handle(
+          Cast<String>(
+              expected_final_map_->instance_descriptors(isolate_)->GetKey(
+                  descriptor_index)),
+          isolate_);
+      target_map = expected_final_map_;
+    } else {
+      TransitionsAccessor transitions(isolate_, *map_);
+      auto expected_transition = transitions.ExpectedTransition(key_chars);
+      if (!expected_transition.first.is_null()) {
+        target_map = expected_transition.second;
+
+        DCHECK_EQ(target_map->instance_descriptors()
+                      ->GetDetails(descriptor_index)
+                      .location(),
+                  PropertyLocation::kField);
+        map_ = target_map;
+        return true;
+      }
+    }
+
+    DirectHandle<String> key = *key_out = get_key(expected_key);
+    if (key.is_identical_to(expected_key)) {
+      DCHECK_EQ(target_map->instance_descriptors()
+                    ->GetDetails(descriptor_index)
+                    .location(),
+                PropertyLocation::kField);
+      map_ = target_map;
+      return true;
+    }
+
+    if (IsOnExpectedFinalMapFastPath()) {
+      RewindExpectedFinalMapFastPathToBeforeCurrent();
+      property_count_in_expected_final_map_ = 0;
+    }
+
+    MaybeHandle<Map> maybe_target =
+        TransitionsAccessor(isolate_, *map_).FindTransitionToField(key);
+    if (!maybe_target.ToHandle(&target_map)) return false;
+
+    map_ = target_map;
+    return true;
+  }
+
+  V8_INLINE bool TryGeneralizeFieldToValue(DirectHandle<Object> value) {
+    DCHECK_LT(current_property_index_, map_->NumberOfOwnDescriptors());
+
+    InternalIndex descriptor_index(current_property_index_);
+    PropertyDetails current_details =
+        map_->instance_descriptors(isolate_)->GetDetails(descriptor_index);
+    Representation expected_representation = current_details.representation();
+
+    DCHECK_EQ(current_details.kind(), PropertyKind::kData);
+    DCHECK_EQ(current_details.location(), PropertyLocation::kField);
+
+    if (!Object::FitsRepresentation(*value, expected_representation)) {
+      Representation representation =
+          Object::OptimalRepresentation(*value, isolate_);
+      representation = representation.generalize(expected_representation);
+      if (!expected_representation.CanBeInPlaceChangedTo(representation)) {
+        if (IsOnExpectedFinalMapFastPath()) {
+          RewindExpectedFinalMapFastPathToIncludeCurrent();
+          property_count_in_expected_final_map_ = 0;
+        }
+        MapUpdater mu(isolate_, map_);
+        Handle<Map> new_map = mu.ReconfigureToDataField(
+            descriptor_index, current_details.attributes(),
+            current_details.constness(), representation,
+            FieldType::Any(isolate_));
+
+        if (new_map->is_dictionary_map()) return false;
+        map_ = new_map;
+        DCHECK(representation.IsDouble());
+        RegisterFieldNeedsFreshHeapNumber(value);
+      } else {
+        DCHECK(!representation.IsDouble());
+        DirectHandle<FieldType> value_type =
+            Object::OptimalType(*value, isolate_, representation);
+        MapUpdater::GeneralizeField(isolate_, map_, descriptor_index,
+                                    current_details.constness(), representation,
+                                    value_type);
+      }
+    } else if (expected_representation.IsHeapObject() &&
+               !FieldType::NowContains(
+                   map_->instance_descriptors(isolate_)->GetFieldType(
+                       descriptor_index),
+                   value)) {
+      DirectHandle<FieldType> value_type =
+          Object::OptimalType(*value, isolate_, expected_representation);
+      MapUpdater::GeneralizeField(isolate_, map_, descriptor_index,
+                                  current_details.constness(),
+                                  expected_representation, value_type);
+    } else if (expected_representation.IsDouble()) {
+      RegisterFieldNeedsFreshHeapNumber(value);
+    }
+
+    DCHECK(FieldType::NowContains(
+        map_->instance_descriptors(isolate_)->GetFieldType(descriptor_index),
+        value));
+    return true;
+  }
+
+  bool TryInitializeMapFromExpectedFinalMap() {
+    if (expected_final_map_.is_null()) return false;
+    if (expected_final_map_->elements_kind() != elements_kind_) return false;
+
+    int property_count_in_expected_final_map =
+        expected_final_map_->NumberOfOwnDescriptors();
+    if (property_count_in_expected_final_map < expected_property_count_)
+      return false;
+
+    map_ = expected_final_map_;
+    property_count_in_expected_final_map_ =
+        property_count_in_expected_final_map;
+    return true;
+  }
+
+  void InitializeMapFromZero() {
+    DCHECK_EQ(current_property_index_, 0);
+
+    map_ = isolate_->factory()->ObjectLiteralMapFromCache(
+        isolate_->native_context(), expected_property_count_);
+    if (elements_kind_ == DICTIONARY_ELEMENTS) {
+      map_ = Map::AsElementsKind(isolate_, map_, elements_kind_);
+    } else {
+      DCHECK_EQ(map_->elements_kind(), elements_kind_);
+    }
+  }
+
+  V8_INLINE bool IsOnExpectedFinalMapFastPath() const {
+    DCHECK_IMPLIES(property_count_in_expected_final_map_ > 0,
+                   !expected_final_map_.is_null());
+    return current_property_index_ < property_count_in_expected_final_map_;
+  }
+
+  void RewindExpectedFinalMapFastPathToBeforeCurrent() {
+    DCHECK_GT(property_count_in_expected_final_map_, 0);
+    if (current_property_index_ == 0) {
+      InitializeMapFromZero();
+      DCHECK_EQ(0, map_->NumberOfOwnDescriptors());
+    }
+    if (current_property_index_ == 0) {
+      return;
+    }
+    DCHECK_EQ(*map_, *expected_final_map_);
+    map_ = handle(map_->FindFieldOwner(
+                      isolate_, InternalIndex(current_property_index_ - 1)),
+                  isolate_);
+  }
+
+  void RewindExpectedFinalMapFastPathToIncludeCurrent() {
+    DCHECK_EQ(*map_, *expected_final_map_);
+    map_ = handle(expected_final_map_->FindFieldOwner(
+                      isolate_, InternalIndex(current_property_index_)),
+                  isolate_);
+  }
+
+  V8_INLINE void RegisterFieldNeedsFreshHeapNumber(DirectHandle<Object> value) {
+    if (heap_number_mode_ == kHeapNumbersGuaranteedUniquelyOwned &&
+        !IsSmi(*value)) {
+      DCHECK(IsHeapNumber(*value));
+      return;
+    }
+    extra_heap_numbers_needed_++;
+  }
+
+  V8_INLINE void AdvanceToNextProperty() { current_property_index_++; }
+
+  Isolate* isolate_;
+  ElementsKind elements_kind_;
+  int expected_property_count_;
+  HeapNumberMode heap_number_mode_;
+
+  DirectHandle<Map> map_;
+  int current_property_index_ = 0;
+  int extra_heap_numbers_needed_ = 0;
+
+  Handle<JSObject> object_;
+
+  DirectHandle<Map> expected_final_map_ = {};
+  int property_count_in_expected_final_map_ = 0;
+};
+
+// ── RdnNamedPropertyValueIterator ──────────────────────────────────
+// Iterates over already-collected RdnProperty values for
+// RdnDataObjectBuilder::CreateAndInitialiseObject (the "revisit values" phase).
+class RdnNamedPropertyValueIterator {
+ public:
+  RdnNamedPropertyValueIterator(const RdnProperty* it,
+                                const RdnProperty* end V8_ALLOW_UNUSED)
+      : it_(it) {
+    DCHECK_LE(it, end);
+  }
+
+  RdnNamedPropertyValueIterator& operator++() {
+    it_++;
+    return *this;
+  }
+
+  DirectHandle<Object> operator*() { return it_->value; }
+
+  bool operator!=(const RdnNamedPropertyValueIterator& other) const {
+    return it_ != other.it_;
+  }
+
+ private:
+  const RdnProperty* it_;
+};
+
 }  // namespace
+
+// ── RdnNamedPropertyIterator ──────────────────────────────────────
+// Implements the iterator protocol required by RdnDataObjectBuilder::
+// BuildFromIterator. Defers string materialization: GetKeyChars() returns raw
+// chars from the source buffer, GetKey() calls MakeString() only when needed.
+template <typename Char>
+class RdnParser<Char>::RdnNamedPropertyIterator {
+ public:
+  RdnNamedPropertyIterator(RdnParser<Char>& parser, const RdnProperty* it,
+                            const RdnProperty* end)
+      : parser_(parser), start_(it), it_(it), end_(end) {
+    DCHECK_LE(it_, end_);
+  }
+
+  void Advance() {
+    DCHECK_LT(it_, end_);
+    it_++;
+  }
+
+  bool Done() const {
+    DCHECK_LE(it_, end_);
+    return it_ == end_;
+  }
+
+  base::Vector<const Char> GetKeyChars() {
+    // For pre-materialized keys (default RdnString, length 0), return empty
+    // vector. The builder's ExpectedTransition will miss and fall through to
+    // GetKey() which returns the materialized string.
+    return parser_.GetKeyChars(it_->string);
+  }
+  Handle<String> GetKey(Handle<String> expected_key_hint) {
+    if (!it_->materialized_key.is_null()) return it_->materialized_key;
+    return parser_.MakeString(it_->string, expected_key_hint);
+  }
+  Handle<Object> GetValue(bool will_revisit_value) {
+    return it_->value;
+  }
+  RdnNamedPropertyValueIterator RevisitValues() {
+    return RdnNamedPropertyValueIterator(start_, it_);
+  }
+
+ private:
+  RdnParser<Char>& parser_;
+
+  const RdnProperty* start_;
+  const RdnProperty* it_;
+  const RdnProperty* end_;
+};
 
 // ── Constructor ───────────────────────────────────────────────────
 // Registers GC epilogue callback for pointer relocation.
@@ -242,6 +775,8 @@ RdnParser<Char>::RdnParser(Isolate* isolate, Handle<String> source)
 
   // Pre-allocate the GC-safe map cache before entering DisallowGC scope.
   object_map_cache_ = factory_->NewFixedArray(kObjectMapCacheSize);
+  // Cache the Object constructor for fast empty {} creation.
+  object_constructor_ = handle(isolate_->native_context()->object_function(), isolate_);
 
   if (StringShape(*source_).IsExternal()) {
     chars_ =
@@ -588,7 +1123,13 @@ V8_INLINE MaybeHandle<Object> RdnParser<Char>::ParseValue() {
   if (c == '"') return ParseString();
   if (c == '{') return ParseBrace();
   if (c == '[') return ParseArray();
-  if (V8_LIKELY(IsDecimalDigit(c) || c == '-')) return ParseNumber();
+  if (V8_LIKELY(IsDecimalDigit(c) || c == '-')) {
+    // -Infinity starts with '-' followed by 'I'. Route to slow path so
+    // ParseNumber's hot path doesn't need to check for it.
+    if (V8_UNLIKELY(c == '-' && remaining_chars() > 1 && Peek(1) == 'I'))
+      return ParseValueSlow();
+    return ParseNumber();
+  }
   if (c == 't') {
     if (V8_LIKELY(Match("true", 4))) {
       Advance(4);
@@ -655,6 +1196,10 @@ MaybeHandle<Object> RdnParser<Char>::ParseValueSlow() {
 
     case RdnToken::BINARY_HEX:
       return ParseBinaryHex();
+
+    case RdnToken::NUMBER:
+      // Reached via ParseValue for -Infinity (c == '-', Peek(1) == 'I').
+      return ParseNumber();
 
     default:
       ReportError("Unexpected character");
@@ -1077,7 +1622,7 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
         factory_->NewJSArray(0, PACKED_SMI_ELEMENTS));
   }
 
-  base::SmallVector<Handle<Object>, 16> elements;
+  size_t elem_start = element_stack_.size();
   bool need_parse_current = false;
 
   // ── Number-only fast path ──────────────────────────────────────
@@ -1172,20 +1717,20 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
                (c == '-' && remaining_chars() > 1 && IsDecimalDigit(Peek(1))));
 
       // Fell through: non-number element encountered after some numbers.
-      // Materialize accumulated numbers as Handle<Object>.
+      // Materialize accumulated numbers into element_stack_.
       if (!need_parse_current) need_parse_current = true;
       if (saw_double) {
         for (double d : double_elements_) {
           int smi_val;
           if (DoubleToSmiInteger(d, &smi_val)) {
-            elements.push_back(handle(Smi::FromInt(smi_val), isolate_));
+            element_stack_.push_back(handle(Smi::FromInt(smi_val), isolate_));
           } else {
-            elements.push_back(factory_->NewHeapNumber(d));
+            element_stack_.push_back(factory_->NewHeapNumber(d));
           }
         }
       } else {
         for (int s : smi_elements_) {
-          elements.push_back(handle(Smi::FromInt(s), isolate_));
+          element_stack_.push_back(handle(Smi::FromInt(s), isolate_));
         }
       }
     }
@@ -1193,16 +1738,17 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
 
   // ── General path ───────────────────────────────────────────────
   // Parse first/current element (if not already consumed by number fast path).
-  if (elements.empty() || need_parse_current) {
+  if (element_stack_.size() == elem_start || need_parse_current) {
     Handle<Object> val;
     ASSIGN_RETURN_ON_EXCEPTION(isolate_, val, ParseValue());
-    elements.push_back(val);
+    element_stack_.push_back(val);
     SkipWhitespace();
   }
 
   while (true) {
     if (V8_UNLIKELY(IsAtEnd())) {
       ReportError("Unexpected end of input");
+      element_stack_.resize(elem_start);
       return MaybeHandle<Object>();
     }
     Char c = static_cast<Char>(CurrentChar());
@@ -1212,6 +1758,7 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
     }
     if (V8_UNLIKELY(c != ',')) {
       ReportError("Expected ',' or ']'");
+      element_stack_.resize(elem_start);
       return MaybeHandle<Object>();
     }
     Advance();
@@ -1219,7 +1766,7 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
     // Thread feedback from previous element: if the previous element was a
     // JSObject with a non-detached map, pass it as feedback to guide
     // FastKeyMatch in the next ParseBrace.
-    Handle<Object> prev = elements.back();
+    Handle<Object> prev = element_stack_.back();
     Handle<Object> val;
     if (IsJSObject(*prev)) {
       Tagged<Map> maybe_feedback = Cast<JSObject>(*prev)->map();
@@ -1232,17 +1779,17 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
     } else {
       ASSIGN_RETURN_ON_EXCEPTION(isolate_, val, ParseValue());
     }
-    elements.push_back(val);
+    element_stack_.push_back(val);
 
     SkipWhitespace();
   }
 
-  int len = static_cast<int>(elements.size());
+  int len = static_cast<int>(element_stack_.size() - elem_start);
 
   // Select optimal ElementsKind by scanning collected elements.
   ElementsKind kind = PACKED_SMI_ELEMENTS;
-  for (int i = 0; i < len; i++) {
-    Tagged<Object> value = *elements[i];
+  for (size_t i = elem_start; i < element_stack_.size(); i++) {
+    Tagged<Object> value = *element_stack_[i];
     if (IsHeapObject(value)) {
       if (IsHeapNumber(Cast<HeapObject>(value))) {
         kind = PACKED_DOUBLE_ELEMENTS;
@@ -1257,12 +1804,17 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
   if (kind == PACKED_DOUBLE_ELEMENTS) {
     fixed = FixedDoubleArray::New(
         isolate_, len,
-        [&elements](int i) { return Object::NumberValue(*elements[i]); });
+        [this, elem_start](int i) {
+          return Object::NumberValue(*element_stack_[elem_start + i]);
+        });
   } else {
     fixed = FixedArray::New(isolate_, len,
-        [&elements](int i) { return *elements[i]; });
+        [this, elem_start](int i) {
+          return *element_stack_[elem_start + i];
+        });
   }
 
+  element_stack_.resize(elem_start);
   return handle_scope.CloseAndEscape(
       factory_->NewJSArrayWithElements(fixed, kind, len));
 }
@@ -1321,10 +1873,10 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
   Advance();  // skip {
   SkipWhitespace();
 
-  // Empty {} → object
+  // Empty {} → object (uses cached constructor to avoid re-lookup).
   if (!IsAtEnd() && CurrentChar() == '}') {
     Advance();
-    return factory_->NewJSObject(isolate_->object_function());
+    return factory_->NewJSObject(object_constructor_);
   }
 
   // ── FastKeyMatch fast path ──────────────────────────────────────
@@ -1391,9 +1943,8 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
   // When no array_element_feedback_ was available, try the multi-entry map
   // cache. If any cached map's first descriptor key matches the source bytes,
   // delegate to FinishObjectFastKeys — avoiding ScanRdnString + MakeString
-  // for all keys. This benefits nested objects (metadata, preferences,
-  // transactions) that repeat the same shape across array elements.
-  if (!IsAtEnd() && CurrentChar() == '"') {
+  // for all keys. Skip entirely when cache is empty.
+  if (map_cache_populated_ && !IsAtEnd() && CurrentChar() == '"') {
     const Char* saved_cursor = cursor_;
     int matched_ci = -1;
     int matched_nof = 0;
@@ -1443,7 +1994,6 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
     Advance();  // skip opening "
     RdnString key_desc = ScanRdnString(true);
     if (has_error_) return MaybeHandle<Object>();
-    Handle<String> first_str = MakeString(key_desc);
 
     SkipWhitespace();
     if (IsAtEnd()) {
@@ -1454,8 +2004,11 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
 
     if (sep == ':') {
       // Object: {"key": value, ...}
-      return FinishObject(first_str, feedback);
+      // Pass raw RdnString descriptor — materialization deferred to builder.
+      return FinishObject(key_desc, feedback);
     }
+    // Materialize for non-object paths (Map, Set).
+    Handle<String> first_str = MakeString(key_desc);
     if (sep == '=' && Peek(1) == '>') {
       // Map: {"key" => value, ...}
       return FinishMap(first_str);
@@ -1498,7 +2051,7 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
     }
     Handle<String> first_key =
         factory_->InternalizeString(Cast<String>(first_value));
-    return FinishObject(first_key);
+    return FinishObjectMaterialized(first_key);
   }
 
   // => → Map
@@ -1658,98 +2211,102 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
     }
 
     // ── Slow fallback ─────────────────────────────────────────────
-    // Materialize the matched keys from descriptors and parse any remaining
-    // properties via ScanRdnString + MakeString, then build normally.
+    // Push matched keys (from descriptors) and remaining keys (from
+    // ScanRdnString) onto property_stack_, then build via
+    // RdnDataObjectBuilder for optimal map transitions.
     {
-      base::SmallVector<std::pair<Handle<String>, Handle<Object>>, 16>
-          properties;
+      size_t prop_start = property_stack_.size();
 
-      // Materialize already-matched keys from descriptors.
+      // Push already-matched keys from descriptors (pre-materialized).
       for (int i = 0; i < matched; i++) {
         Handle<String> key(
             Cast<String>(descriptors->GetKey(InternalIndex(i))), isolate_);
-        properties.push_back({key, values[i]});
+        property_stack_.push_back(RdnProperty(key, values[i]));
       }
 
-      // If we broke out before reaching '}', there may be more properties
-      // (either a mismatched key or extra properties beyond the descriptor
-      // count). Parse them with the normal path.
-      // At this point, cursor_ could be at:
-      // - '"' (mismatched key: we backed up to '"')
-      // - ',' (if matched==nof_descriptors but CurrentChar wasn't '}')
-      // - '}' (if matched==nof_descriptors and we fell through from non-tagged)
-
       // If matched < nof_descriptors, we broke at a ',' and are before '"'.
-      // The ',' was already consumed, so we need to parse the remaining key.
+      // The ',' was already consumed, so parse the remaining key.
       if (matched < nof_descriptors) {
-        // We're at '"' — parse the unmatched key normally.
         if (!IsAtEnd() && CurrentChar() == '"') {
           Advance();  // skip opening "
           RdnString key_desc = ScanRdnString(true);
-          if (has_error_) return MaybeHandle<Object>();
-          Handle<String> key = MakeString(key_desc);
+          if (has_error_) {
+            property_stack_.resize(prop_start);
+            return MaybeHandle<Object>();
+          }
           SkipWhitespace();
           if (IsAtEnd() || CurrentChar() != ':') {
             ReportError("Expected ':'");
+            property_stack_.resize(prop_start);
             return MaybeHandle<Object>();
           }
           Advance();  // skip ':'
           Handle<Object> val;
           ASSIGN_RETURN_ON_EXCEPTION(isolate_, val, ParseValue());
-          properties.push_back({key, val});
+          property_stack_.push_back(RdnProperty(key_desc, val));
           SkipWhitespace();
         }
       }
 
-      // Parse any remaining properties.
+      // Parse any remaining properties with deferred keys.
       while (!IsAtEnd() && CurrentChar() == ',') {
         Advance();
         SkipWhitespace();
         if (IsAtEnd() || CurrentChar() != '"') {
           ReportError("Expected string key");
+          property_stack_.resize(prop_start);
           return MaybeHandle<Object>();
         }
         Advance();  // skip opening "
         RdnString key_desc = ScanRdnString(true);
-        if (has_error_) return MaybeHandle<Object>();
-        Handle<String> key = MakeString(key_desc);
+        if (has_error_) {
+          property_stack_.resize(prop_start);
+          return MaybeHandle<Object>();
+        }
         SkipWhitespace();
         if (IsAtEnd() || CurrentChar() != ':') {
           ReportError("Expected ':'");
+          property_stack_.resize(prop_start);
           return MaybeHandle<Object>();
         }
         Advance();  // skip ':'
         Handle<Object> val;
         ASSIGN_RETURN_ON_EXCEPTION(isolate_, val, ParseValue());
-        properties.push_back({key, val});
+        property_stack_.push_back(RdnProperty(key_desc, val));
         SkipWhitespace();
       }
 
       if (IsAtEnd() || CurrentChar() != '}') {
         ReportError("Expected '}'");
+        property_stack_.resize(prop_start);
         return MaybeHandle<Object>();
       }
       Advance();  // skip '}'
 
-      int count = static_cast<int>(properties.size());
-      Handle<Map> map = factory_->ObjectLiteralMapFromCache(
-          isolate_->native_context(), count);
-      Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
-      for (int i = 0; i < count; i++) {
-        JSObject::AddProperty(isolate_, obj, properties[i].first,
-                              properties[i].second, NONE);
-      }
+      int count = static_cast<int>(property_stack_.size() - prop_start);
+      RdnDataObjectBuilder builder(
+          isolate_, HOLEY_ELEMENTS, count, feedback,
+          RdnDataObjectBuilder::kHeapNumbersGuaranteedUniquelyOwned);
+      RdnNamedPropertyIterator prop_it(
+          *this, &property_stack_[prop_start],
+          &property_stack_[prop_start] + count);
+      Handle<JSObject> obj = builder.BuildFromIterator(prop_it);
+
       object_map_cache_->set(object_map_cache_next_, obj->map());
       object_map_cache_counts_[object_map_cache_next_] = count;
       object_map_cache_next_ =
           (object_map_cache_next_ + 1) % kObjectMapCacheSize;
+      map_cache_populated_ = true;
+
+      property_stack_.resize(prop_start);
       return handle_scope.CloseAndEscape(handle(*obj, isolate_));
     }
   }
 
 slow_fallback_start:
   // Deprecated map — can't use fast path. But cursor is past first key.
-  // Materialize first key from descriptor[0] and delegate to FinishObject.
+  // Materialize first key from descriptor[0] and delegate to
+  // FinishObjectMaterialized.
   {
     Handle<String> first_key(
         Cast<String>(descriptors->GetKey(InternalIndex(0))), isolate_);
@@ -1758,24 +2315,233 @@ slow_fallback_start:
       ReportError("Expected ':'");
       return MaybeHandle<Object>();
     }
-    return FinishObject(first_key);
+    return FinishObjectMaterialized(first_key);
   }
 }
 
-// ── Object construction ───────────────────────────────────────────
-// Collects all properties first, then builds the object.
-// Uses map feedback: if the last object had the same keys in the same order,
-// we reuse its map directly and write properties at known offsets, avoiding
-// all transition lookups.
-// Reference: json-parser.cc:1350-1418 (BuildJsonObject)
+// ── FinishObject (RdnString overload) ─────────────────────────────
+// Fast path: first key as deferred RdnString descriptor. Uses property_stack_
+// for deferred string materialization, and RdnDataObjectBuilder for optimal
+// object construction via pre-computed map transitions.
 
 template <typename Char>
-MaybeHandle<Object> RdnParser<Char>::FinishObject(Handle<String> first_key,
+MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_desc,
                                                    Handle<Map> feedback) {
   HandleScope handle_scope(isolate_);
   Advance();  // skip :
 
-  // Collect all properties.
+  size_t start = property_stack_.size();
+
+  // Parse first value and push with deferred key.
+  Handle<Object> first_val;
+  ASSIGN_RETURN_ON_EXCEPTION(isolate_, first_val, ParseValue());
+  property_stack_.push_back(RdnProperty(first_key_desc, first_val));
+  SkipWhitespace();
+
+  // Parse remaining properties with deferred key materialization.
+  while (true) {
+    if (IsAtEnd()) {
+      ReportError("Unexpected end of input");
+      property_stack_.resize(start);
+      return MaybeHandle<Object>();
+    }
+    base::uc32 c = CurrentChar();
+    if (c == '}') {
+      Advance();
+      break;
+    }
+    if (c != ',') {
+      ReportError("Expected ',' or '}'");
+      property_stack_.resize(start);
+      return MaybeHandle<Object>();
+    }
+    Advance();
+    SkipWhitespace();
+    if (IsAtEnd() || CurrentChar() != '"') {
+      ReportError("Expected string key");
+      property_stack_.resize(start);
+      return MaybeHandle<Object>();
+    }
+
+    // Deferred key scan — NO MakeString call.
+    Advance();  // skip opening "
+    RdnString key_desc = ScanRdnString(true);
+    if (has_error_) {
+      property_stack_.resize(start);
+      return MaybeHandle<Object>();
+    }
+
+    SkipWhitespace();
+    if (IsAtEnd() || CurrentChar() != ':') {
+      ReportError("Expected ':'");
+      property_stack_.resize(start);
+      return MaybeHandle<Object>();
+    }
+    Advance();  // skip :
+
+    Handle<Object> val;
+    ASSIGN_RETURN_ON_EXCEPTION(isolate_, val, ParseValue());
+    property_stack_.push_back(RdnProperty(key_desc, val));
+    SkipWhitespace();
+  }
+
+  int count = static_cast<int>(property_stack_.size() - start);
+
+  // ── kUnknown learning ───────────────────────────────────────────
+  // Validate parsed keys against the feedback descriptor array to promote
+  // or demote the fast-iterable state for future parses.
+  if (!feedback.is_null()) {
+    using FastIterableState = DescriptorArray::FastIterableState;
+    Handle<DescriptorArray> descriptors(
+        feedback->instance_descriptors(), isolate_);
+    int nof = feedback->NumberOfOwnDescriptors();
+
+    if (descriptors->fast_iterable() == FastIterableState::kUnknown &&
+        nof == count) {
+      bool all_fast = true;
+      {
+        DisallowGarbageCollection no_gc;
+        Tagged<DescriptorArray> desc = *descriptors;
+        for (int i = 0; i < count; i++) {
+          Tagged<Name> property_name = desc->GetKey(InternalIndex(i));
+
+          if (IsSymbol(property_name)) { all_fast = false; break; }
+
+          // Compare raw key chars against descriptor key.
+          base::Vector<const Char> key_chars =
+              GetKeyChars(property_stack_[start + i].string);
+          if (!Cast<String>(property_name)->IsEqualTo(key_chars)) {
+            all_fast = false;
+            break;
+          }
+
+          PropertyDetails details = desc->GetDetails(InternalIndex(i));
+          if (details.IsDontEnum() ||
+              details.location() != PropertyLocation::kField) {
+            all_fast = false;
+            break;
+          }
+
+          Tagged<String> key_str = Cast<String>(property_name);
+          if (!InstanceTypeChecker::IsOneByteString(key_str->map())) {
+            all_fast = false;
+            break;
+          }
+        }
+      }
+      if (all_fast) {
+        descriptors->set_fast_iterable_if(FastIterableState::kJsonFast,
+                                          FastIterableState::kUnknown);
+      } else {
+        descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
+      }
+    }
+  }
+
+  // ── Map cache fast path ─────────────────────────────────────────
+  // Search the multi-entry map cache for a matching shape. On hit,
+  // stamp out properties directly via FastPropertyAtPut (no transitions).
+  if (map_cache_populated_) {
+    for (int ci = 0; ci < kObjectMapCacheSize; ci++) {
+      if (object_map_cache_counts_[ci] != count) continue;
+      Tagged<Object> cached_entry = object_map_cache_->get(ci);
+      if (!IsMap(cached_entry)) continue;
+      Tagged<Map> cached_map = Cast<Map>(cached_entry);
+      if (cached_map->NumberOfOwnDescriptors() != count) continue;
+
+      bool keys_match = true;
+      bool all_compatible = true;
+      {
+        DisallowGarbageCollection no_gc;
+        Tagged<DescriptorArray> desc = cached_map->instance_descriptors();
+        for (int i = 0; i < count; i++) {
+          Tagged<Name> expected = desc->GetKey(InternalIndex(i));
+          base::Vector<const Char> key_chars =
+              GetKeyChars(property_stack_[start + i].string);
+          if (!Cast<String>(expected)->IsEqualTo(key_chars)) {
+            keys_match = false;
+            break;
+          }
+        }
+        if (keys_match) {
+          for (int i = 0; i < count; i++) {
+            PropertyDetails details = desc->GetDetails(InternalIndex(i));
+            if (details.location() != PropertyLocation::kField) {
+              all_compatible = false;
+              break;
+            }
+            Representation rep = details.representation();
+            Tagged<Object> val = *property_stack_[start + i].value;
+            if (rep.IsSmi()) {
+              if (!IsSmi(val)) { all_compatible = false; break; }
+            } else if (rep.IsDouble()) {
+              if (!IsNumber(val)) { all_compatible = false; break; }
+            } else if (rep.IsHeapObject()) {
+              if (IsSmi(val)) { all_compatible = false; break; }
+            }
+          }
+        }
+      }
+      if (keys_match && all_compatible) {
+        Handle<Map> map_handle(cached_map, isolate_);
+        Handle<JSObject> obj = factory_->NewJSObjectFromMap(map_handle);
+        {
+          DisallowGarbageCollection no_gc;
+          Tagged<Map> raw_map = *map_handle;
+          for (int i = 0; i < count; i++) {
+            FieldIndex field_index = FieldIndex::ForDetails(
+                raw_map,
+                raw_map->instance_descriptors()->GetDetails(InternalIndex(i)));
+            obj->FastPropertyAtPut(field_index,
+                                   *property_stack_[start + i].value,
+                                   SKIP_WRITE_BARRIER);
+          }
+        }
+        property_stack_.resize(start);
+        return handle_scope.CloseAndEscape(handle(*obj, isolate_));
+      }
+    }
+  }
+
+  // ── Builder slow path ───────────────────────────────────────────
+  // Use RdnDataObjectBuilder for optimal map transition-based construction.
+  // The builder uses GetKeyChars() for fast expected-transition matching and
+  // only materializes strings (via GetKey) when needed.
+  {
+    Handle<Map> expected_map;
+    if (!feedback.is_null() && !feedback->is_deprecated()) {
+      expected_map = feedback;
+    }
+    RdnDataObjectBuilder builder(
+        isolate_, HOLEY_ELEMENTS, count, expected_map,
+        RdnDataObjectBuilder::kHeapNumbersGuaranteedUniquelyOwned);
+    RdnNamedPropertyIterator it(
+        *this, &property_stack_[start],
+        &property_stack_[start] + count);
+    Handle<JSObject> obj = builder.BuildFromIterator(it);
+
+    // Update map cache (round-robin).
+    object_map_cache_->set(object_map_cache_next_, obj->map());
+    object_map_cache_counts_[object_map_cache_next_] = count;
+    object_map_cache_next_ =
+        (object_map_cache_next_ + 1) % kObjectMapCacheSize;
+    map_cache_populated_ = true;
+
+    property_stack_.resize(start);
+    return handle_scope.CloseAndEscape(handle(*obj, isolate_));
+  }
+}
+
+// ── FinishObjectMaterialized ──────────────────────────────────────
+// Slow overload for pre-materialized first key (rare paths: ParseBrace
+// slow disambiguation, deprecated map fallback). Uses simple AddProperty.
+
+template <typename Char>
+MaybeHandle<Object> RdnParser<Char>::FinishObjectMaterialized(
+    Handle<String> first_key) {
+  HandleScope handle_scope(isolate_);
+  Advance();  // skip :
+
   base::SmallVector<std::pair<Handle<String>, Handle<Object>>, 16> properties;
 
   Handle<Object> first_val;
@@ -1804,7 +2570,6 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(Handle<String> first_key,
       return MaybeHandle<Object>();
     }
 
-    // Parse property key with deferred scan + internalization.
     Advance();  // skip opening "
     RdnString key_desc = ScanRdnString(true);
     if (has_error_) return MaybeHandle<Object>();
@@ -1824,121 +2589,6 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(Handle<String> first_key,
   }
 
   int count = static_cast<int>(properties.size());
-
-  // ── kUnknown learning ───────────────────────────────────────────
-  // When feedback has kUnknown descriptors, validate each key against the
-  // descriptor array. If all pass, promote to kJsonFast for the next parse.
-  // If any fail, mark as kJsonSlow permanently.
-  if (!feedback.is_null()) {
-    using FastIterableState = DescriptorArray::FastIterableState;
-    Handle<DescriptorArray> descriptors(
-        feedback->instance_descriptors(), isolate_);
-    int nof = feedback->NumberOfOwnDescriptors();
-
-    if (descriptors->fast_iterable() == FastIterableState::kUnknown &&
-        nof == count) {
-      bool all_fast = true;
-      {
-        DisallowGarbageCollection no_gc;
-        Tagged<DescriptorArray> desc = *descriptors;
-        for (int i = 0; i < count; i++) {
-          Tagged<Name> property_name = desc->GetKey(InternalIndex(i));
-
-          // Symbol keys are slow.
-          if (IsSymbol(property_name)) { all_fast = false; break; }
-
-          // Check that it matches the parsed key.
-          if (*properties[i].first != property_name) {
-            all_fast = false;
-            break;
-          }
-
-          // Must be enumerable and field-located.
-          PropertyDetails details = desc->GetDetails(InternalIndex(i));
-          if (details.IsDontEnum() ||
-              details.location() != PropertyLocation::kField) {
-            all_fast = false;
-            break;
-          }
-
-          // Must be a one-byte string.
-          Tagged<String> key_str = Cast<String>(property_name);
-          if (!InstanceTypeChecker::IsOneByteString(key_str->map())) {
-            all_fast = false;
-            break;
-          }
-        }
-      }
-      if (all_fast) {
-        descriptors->set_fast_iterable_if(FastIterableState::kJsonFast,
-                                          FastIterableState::kUnknown);
-      } else {
-        descriptors->set_fast_iterable(FastIterableState::kJsonSlow);
-      }
-    }
-  }
-
-  // Fast path: search the multi-entry map cache for a matching shape.
-  // The cache is a GC-safe FixedArray — entries are properly traced by GC.
-  for (int ci = 0; ci < kObjectMapCacheSize; ci++) {
-    if (object_map_cache_counts_[ci] != count) continue;
-    Tagged<Object> cached_entry = object_map_cache_->get(ci);
-    if (!IsMap(cached_entry)) continue;
-    Tagged<Map> cached_map = Cast<Map>(cached_entry);
-    if (cached_map->NumberOfOwnDescriptors() != count) continue;
-
-    bool keys_match = true;
-    bool all_compatible = true;
-    {
-      DisallowGarbageCollection no_gc;
-      Tagged<DescriptorArray> desc = cached_map->instance_descriptors();
-      for (int i = 0; i < count; i++) {
-        Tagged<Name> expected = desc->GetKey(InternalIndex(i));
-        if (*properties[i].first != expected) {
-          keys_match = false;
-          break;
-        }
-      }
-      if (keys_match) {
-        for (int i = 0; i < count; i++) {
-          PropertyDetails details = desc->GetDetails(InternalIndex(i));
-          if (details.location() != PropertyLocation::kField) {
-            all_compatible = false;
-            break;
-          }
-          Representation rep = details.representation();
-          Tagged<Object> val = *properties[i].second;
-          if (rep.IsSmi()) {
-            if (!IsSmi(val)) { all_compatible = false; break; }
-          } else if (rep.IsDouble()) {
-            if (!IsNumber(val)) { all_compatible = false; break; }
-          } else if (rep.IsHeapObject()) {
-            if (IsSmi(val)) { all_compatible = false; break; }
-          }
-        }
-      }
-    }
-    if (keys_match && all_compatible) {
-      Handle<Map> map_handle(cached_map, isolate_);
-      Handle<JSObject> obj = factory_->NewJSObjectFromMap(map_handle);
-      {
-        DisallowGarbageCollection no_gc;
-        Tagged<Map> raw_map = *map_handle;
-        for (int i = 0; i < count; i++) {
-          FieldIndex field_index = FieldIndex::ForDetails(
-              raw_map,
-              raw_map->instance_descriptors()->GetDetails(InternalIndex(i)));
-          obj->FastPropertyAtPut(field_index, *properties[i].second,
-                                 SKIP_WRITE_BARRIER);
-        }
-      }
-      return handle_scope.CloseAndEscape(handle(*obj, isolate_));
-    }
-  }
-
-  // Slow path: build from scratch using ObjectLiteralMapFromCache +
-  // AddProperty. The keys are internalized, so V8 uses the fast transition
-  // path (pointer comparison in TransitionsAccessor).
   Handle<Map> map = factory_->ObjectLiteralMapFromCache(
       isolate_->native_context(), count);
   Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
@@ -1947,12 +2597,6 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(Handle<String> first_key,
     JSObject::AddProperty(isolate_, obj, properties[i].first,
                           properties[i].second, NONE);
   }
-
-  // Insert into the GC-safe map cache (round-robin).
-  object_map_cache_->set(object_map_cache_next_, obj->map());
-  object_map_cache_counts_[object_map_cache_next_] = count;
-  object_map_cache_next_ =
-      (object_map_cache_next_ + 1) % kObjectMapCacheSize;
 
   return handle_scope.CloseAndEscape(handle(*obj, isolate_));
 }

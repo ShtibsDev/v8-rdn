@@ -48,6 +48,24 @@ class RdnString final {
   bool has_escape_ : 1;
 };
 
+// Property descriptor for deferred object construction via RdnDataObjectBuilder.
+// Holds the raw RdnString key (position + length, no allocation) alongside the
+// parsed value. This enables the builder's iterator to call GetKeyChars()
+// without materializing strings.
+struct RdnProperty {
+  RdnProperty() = default;
+  RdnProperty(const RdnString& string, Handle<Object> value)
+      : string(string), value(value) {}
+  // Constructor for pre-materialized keys (rare paths: deprecated map, slow
+  // ParseBrace). The materialized_key is returned by the iterator's GetKey()
+  // while the dummy RdnString causes the builder's fast transition to skip.
+  RdnProperty(Handle<String> materialized_key, Handle<Object> value)
+      : string(), value(value), materialized_key(materialized_key) {}
+  RdnString string;
+  Handle<Object> value;
+  Handle<String> materialized_key;
+};
+
 // RDN parser — recursive descent parser for the RDN data format.
 // Template on Char (uint8_t for one-byte strings, uint16_t for two-byte).
 template <typename Char>
@@ -62,6 +80,9 @@ class RdnParser final {
   static constexpr base::uc32 kEndOfString = static_cast<base::uc32>(-1);
   static constexpr base::uc32 kInvalidUnicodeCharacter =
       static_cast<base::uc32>(-1);
+
+  // Nested iterator class — implemented in rdn-parser.cc.
+  class RdnNamedPropertyIterator;
 
  private:
   RdnParser(Isolate* isolate, Handle<String> source);
@@ -83,8 +104,14 @@ class RdnParser final {
   MaybeHandle<Object> ParseArray();
   MaybeHandle<Object> ParseTuple();
   MaybeHandle<Object> ParseBrace();
-  MaybeHandle<Object> FinishObject(Handle<String> first_key,
+  // Fast path: first key as deferred RdnString descriptor (from ParseBrace
+  // string path). Uses property_stack_ + RdnDataObjectBuilder for optimal
+  // object construction with deferred string materialization.
+  MaybeHandle<Object> FinishObject(const RdnString& first_key_desc,
                                    Handle<Map> feedback = Handle<Map>());
+  // Slow path: first key already materialized (rare paths: ParseBrace slow
+  // disambiguation, deprecated map fallback). Uses simple AddProperty loop.
+  MaybeHandle<Object> FinishObjectMaterialized(Handle<String> first_key);
   MaybeHandle<Object> FinishObjectFastKeys(Handle<Map> feedback,
                                            Handle<DescriptorArray> descriptors,
                                            int nof_descriptors);
@@ -221,6 +248,19 @@ class RdnParser final {
   // Reference: json-parser.h smi_elements_ / double_elements_.
   base::SmallVector<int, 64> smi_elements_;
   base::SmallVector<double, 64> double_elements_;
+
+  // Persistent property/element stacks for nested parsing.
+  // Replaces per-call-frame SmallVector allocations.
+  // Reference: json-parser.h property_stack_ / element_stack_.
+  base::SmallVector<Handle<Object>, 16> element_stack_;
+  base::SmallVector<RdnProperty, 16> property_stack_;
+
+  // Cached object constructor for fast empty {} creation.
+  Handle<JSFunction> object_constructor_;
+
+  // Whether the map cache has ever been populated. Skips the 4-entry linear
+  // scan in ParseBrace when all entries are empty.
+  bool map_cache_populated_ = false;
 };
 
 extern template class RdnParser<uint8_t>;
