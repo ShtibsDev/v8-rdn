@@ -16,6 +16,9 @@
 namespace v8 {
 namespace internal {
 
+class JSMap;
+class JSSet;
+
 // Deferred string descriptor — records location in source without allocation.
 // Modeled after JsonString in json-parser.h.
 class RdnString final {
@@ -76,7 +79,7 @@ class RdnParser final {
   using SeqExternalString = typename CharTraits<Char>::ExternalString;
 
   V8_WARN_UNUSED_RESULT static MaybeHandle<Object> Parse(
-      Isolate* isolate, Handle<String> source);
+      Isolate* isolate, Handle<String> source, Handle<Object> reviver);
 
   static constexpr base::uc32 kEndOfString = static_cast<base::uc32>(-1);
   static constexpr base::uc32 kInvalidUnicodeCharacter =
@@ -302,6 +305,31 @@ class RdnParser final {
 
 extern template class RdnParser<uint8_t>;
 extern template class RdnParser<uint16_t>;
+
+// Post-parse reviver walk for RDN.parse(text, reviver).
+// Modeled on JsonParseInternalizer but without source-text tracking,
+// extended for Map/Set types.
+class RdnParseInternalizer {
+ public:
+  static MaybeHandle<Object> Internalize(Isolate* isolate,
+                                         Handle<Object> result,
+                                         Handle<JSReceiver> reviver);
+
+ private:
+  RdnParseInternalizer(Isolate* isolate, Handle<JSReceiver> reviver)
+      : isolate_(isolate), reviver_(reviver) {}
+
+  MaybeHandle<Object> InternalizeJsonProperty(Handle<JSReceiver> holder,
+                                              Handle<Object> name);
+
+  bool RecurseAndApply(Handle<JSReceiver> holder, Handle<String> name);
+
+  Maybe<bool> InternalizeMapEntries(Handle<JSMap> map);
+  Maybe<bool> InternalizeSetEntries(Handle<JSSet> set);
+
+  Isolate* isolate_;
+  Handle<JSReceiver> reviver_;
+};
 
 }  // namespace internal
 }  // namespace v8

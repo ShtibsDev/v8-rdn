@@ -15,6 +15,7 @@
 
 #include "src/base/strings.h"
 #include "src/common/assert-scope.h"
+#include "src/execution/execution.h"
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/numbers/conversions.h"
@@ -229,7 +230,27 @@ class RdnStringifier {
     if (two_byte_ptr_) delete[] two_byte_ptr_;
   }
 
+  void SetReplacer(Handle<JSReceiver> replacer) {
+    replacer_function_ = replacer;
+  }
+
+  bool HasReplacer() const { return !replacer_function_.is_null(); }
+
   MaybeHandle<Object> Stringify(Handle<Object> value) {
+    // When replacer is present, wrap root in {"": value} and apply replacer.
+    if (HasReplacer()) {
+      Handle<JSObject> holder = factory_->NewJSObject(isolate_->object_function());
+      Handle<String> empty = factory_->empty_string();
+      JSObject::AddProperty(isolate_, holder, empty, value, NONE);
+      Handle<Object> replaced;
+      ASSIGN_RETURN_ON_EXCEPTION(isolate_, replaced, ApplyReplacer(value, empty, holder));
+      if (IsUndefined(*replaced, isolate_) || IsJSFunction(*replaced) ||
+          IsSymbol(*replaced)) {
+        return factory_->undefined_value();
+      }
+      value = replaced;
+    }
+
     if (IsUndefined(*value, isolate_) || IsJSFunction(*value) ||
         IsSymbol(*value)) {
       return isolate_->factory()->undefined_value();
@@ -610,6 +631,18 @@ class RdnStringifier {
   int stack_nesting_level_;
   bool need_stack_;
   std::vector<Handle<Object>> stack_;
+
+  // Replacer function (callable) — empty when no replacer is provided.
+  Handle<JSReceiver> replacer_function_;
+
+  // Apply the replacer function: replacer.call(holder, key, value).
+  // Returns the replacer's return value.
+  MaybeHandle<Object> ApplyReplacer(Handle<Object> value, Handle<Object> key,
+                                    Handle<Object> holder) {
+    DirectHandle<Object> argv[] = {key, value};
+    return Execution::Call(isolate_, replacer_function_, holder,
+                           base::VectorOf(argv, 2));
+  }
 
   // Property key cache for fast repeated key serialization.
   SimplePropertyKeyCache key_cache_;
@@ -1045,6 +1078,39 @@ bool RdnStringifier::SerializeJSArray(Handle<JSArray> array) {
 
   AppendCharacter('[');
 
+  // When replacer is present, use slow generic path only.
+  if (HasReplacer()) {
+    for (uint32_t i = 0; i < length; i++) {
+      if (i > 0) AppendCharacter(',');
+      Handle<Object> element;
+      MaybeHandle<Object> maybe_element =
+          JSReceiver::GetElement(isolate_, array, i);
+      if (!maybe_element.ToHandle(&element)) {
+        StackPop();
+        return false;
+      }
+      Handle<Object> key = factory_->NumberToString(factory_->NewNumber(i));
+      Handle<Object> replaced;
+      if (!ApplyReplacer(element, key, array).ToHandle(&replaced)) {
+        StackPop();
+        return false;
+      }
+      // Undefined return from replacer → emit null (matching JSON array behavior).
+      if (IsUndefined(*replaced, isolate_) || IsJSFunction(*replaced) ||
+          IsSymbol(*replaced)) {
+        AppendCStringLiteral("null");
+      } else {
+        if (!SerializeValue(replaced)) {
+          StackPop();
+          return false;
+        }
+      }
+    }
+    AppendCharacter(']');
+    StackPop();
+    return true;
+  }
+
   // Fast path: dispatch on ElementsKind.
   ElementsKind kind = array->GetElementsKind();
 
@@ -1189,7 +1255,8 @@ bool RdnStringifier::SerializeJSArray(Handle<JSArray> array) {
 bool RdnStringifier::SerializeJSObject(Handle<JSObject> object) {
   PtrComprCageBase cage_base(isolate_);
 
-  if (!CanFastSerializeJSObject(*object, isolate_)) {
+  // Replacer invalidates fast-path raw pointers (triggers GC).
+  if (HasReplacer() || !CanFastSerializeJSObject(*object, isolate_)) {
     return SerializeJSObjectSlow(object);
   }
 
@@ -1326,6 +1393,16 @@ bool RdnStringifier::SerializeJSObjectSlow(Handle<JSObject> object) {
       return false;
     }
 
+    // Apply replacer if present.
+    if (HasReplacer()) {
+      Handle<Object> replaced;
+      if (!ApplyReplacer(value, key, object).ToHandle(&replaced)) {
+        StackPop();
+        return false;
+      }
+      value = replaced;
+    }
+
     if (IsUndefined(*value, isolate_) || IsJSFunction(*value) ||
         IsSymbol(*value)) {
       continue;
@@ -1436,6 +1513,56 @@ bool RdnStringifier::SerializeJSMap(Handle<JSMap> map) {
     return true;
   }
 
+  // When replacer is present, collect entries first (two-pass).
+  if (HasReplacer()) {
+    // Pass 1: collect all entries.
+    std::vector<std::pair<Handle<Object>, Handle<Object>>> entries;
+    entries.reserve(num_elements);
+    {
+      ReadOnlyRoots roots(isolate_);
+      for (InternalIndex i : table->IterateEntries()) {
+        Tagged<Object> raw_key;
+        if (!table->ToKey(roots, i, &raw_key)) continue;
+        Handle<Object> key(raw_key, isolate_);
+        Handle<Object> value(table->ValueAt(i), isolate_);
+        entries.push_back({key, value});
+        table = Cast<OrderedHashMap>(map->table());
+      }
+    }
+
+    // Pass 2: apply replacer and serialize survivors.
+    Result stack_push = StackPush(map);
+    if (stack_push != SUCCESS) return false;
+
+    bool any_survived = false;
+    bool first = true;
+    for (auto& [map_key, map_value] : entries) {
+      Handle<Object> replaced;
+      // Key is the actual map key (any type), not a string.
+      if (!ApplyReplacer(map_value, map_key, map).ToHandle(&replaced)) {
+        StackPop();
+        return false;
+      }
+      if (IsUndefined(*replaced, isolate_)) continue;
+      if (!any_survived) {
+        AppendCharacter('{');
+        any_survived = true;
+      }
+      if (!first) AppendCharacter(',');
+      first = false;
+      if (!SerializeValue(map_key)) { StackPop(); return false; }
+      AppendCStringLiteral("=>");
+      if (!SerializeValue(replaced)) { StackPop(); return false; }
+    }
+    if (any_survived) {
+      AppendCharacter('}');
+    } else {
+      AppendCStringLiteral("Map{}");
+    }
+    StackPop();
+    return true;
+  }
+
   Result stack_push = StackPush(map);
   if (stack_push != SUCCESS) return false;
 
@@ -1484,6 +1611,52 @@ bool RdnStringifier::SerializeJSSet(Handle<JSSet> set) {
 
   if (num_elements == 0) {
     AppendCStringLiteral("Set{}");
+    return true;
+  }
+
+  // When replacer is present, collect elements first (two-pass).
+  if (HasReplacer()) {
+    // Pass 1: collect all elements.
+    std::vector<Handle<Object>> elements;
+    elements.reserve(num_elements);
+    {
+      ReadOnlyRoots roots(isolate_);
+      for (InternalIndex i : table->IterateEntries()) {
+        Tagged<Object> raw_key;
+        if (!table->ToKey(roots, i, &raw_key)) continue;
+        elements.push_back(handle(raw_key, isolate_));
+        table = Cast<OrderedHashSet>(set->table());
+      }
+    }
+
+    // Pass 2: apply replacer and serialize survivors.
+    Result stack_push = StackPush(set);
+    if (stack_push != SUCCESS) return false;
+
+    bool any_survived = false;
+    bool first = true;
+    for (int idx = 0; idx < static_cast<int>(elements.size()); idx++) {
+      Handle<Object> key = factory_->NumberToString(factory_->NewNumber(idx));
+      Handle<Object> replaced;
+      if (!ApplyReplacer(elements[idx], key, set).ToHandle(&replaced)) {
+        StackPop();
+        return false;
+      }
+      if (IsUndefined(*replaced, isolate_)) continue;
+      if (!any_survived) {
+        AppendCharacter('{');
+        any_survived = true;
+      }
+      if (!first) AppendCharacter(',');
+      first = false;
+      if (!SerializeValue(replaced)) { StackPop(); return false; }
+    }
+    if (any_survived) {
+      AppendCharacter('}');
+    } else {
+      AppendCStringLiteral("Set{}");
+    }
+    StackPop();
     return true;
   }
 
@@ -3333,11 +3506,18 @@ MaybeHandle<Object> FastRdnStringify(Isolate* isolate,
 
 // ── Public entry point ────────────────────────────────────────────
 
-MaybeHandle<Object> RdnStringify(Isolate* isolate, Handle<Object> object) {
-  if (v8_flags.rdn_stringify_fast_path) {
+MaybeHandle<Object> RdnStringify(Isolate* isolate, Handle<Object> object,
+                                 Handle<Object> replacer) {
+  bool has_replacer = !replacer.is_null() && IsCallable(*replacer);
+
+  // Fast path only when no replacer is provided.
+  if (!has_replacer && v8_flags.rdn_stringify_fast_path) {
     return FastRdnStringify(isolate, object);
   }
   RdnStringifier stringifier(isolate);
+  if (has_replacer) {
+    stringifier.SetReplacer(Cast<JSReceiver>(replacer));
+  }
   return stringifier.Stringify(object);
 }
 

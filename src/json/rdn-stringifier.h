@@ -11,7 +11,7 @@ namespace v8 {
 namespace internal {
 
 V8_WARN_UNUSED_RESULT MaybeHandle<Object> RdnStringify(
-    Isolate* isolate, Handle<Object> object);
+    Isolate* isolate, Handle<Object> object, Handle<Object> replacer);
 
 }  // namespace internal
 }  // namespace v8

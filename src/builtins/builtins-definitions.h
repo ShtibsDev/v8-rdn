@@ -812,7 +812,7 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
                                                                                \
   /* RDN */                                                                    \
   CPP(RdnParse, kDontAdaptArgumentsSentinel)                                   \
-  CPP(RdnStringify, JSParameterCount(1))                                       \
+  CPP(RdnStringify, JSParameterCount(2))                                       \
                                                                                \
   /* ICs */                                                                    \
   TFH(LoadIC, LoadWithVector)                                                  \

@@ -3454,9 +3454,9 @@ void Genesis::InitializeGlobal(DirectHandle<JSGlobalObject> global_object,
     DirectHandle<JSObject> rdn =
         factory->NewJSObject(isolate_->object_function(), AllocationType::kOld);
     JSObject::AddProperty(isolate_, global, "RDN", rdn, DONT_ENUM);
-    SimpleInstallFunction(isolate_, rdn, "parse", Builtin::kRdnParse, 1,
+    SimpleInstallFunction(isolate_, rdn, "parse", Builtin::kRdnParse, 2,
                           kDontAdapt);
-    SimpleInstallFunction(isolate_, rdn, "stringify", Builtin::kRdnStringify, 1,
+    SimpleInstallFunction(isolate_, rdn, "stringify", Builtin::kRdnStringify, 2,
                           kAdapt);
     InstallToStringTag(isolate_, rdn, "RDN");
   }

@@ -22,6 +22,7 @@
 #include "src/common/globals.h"
 #include "src/common/high-allocation-throughput-scope.h"
 #include "src/date/date.h"
+#include "src/execution/execution.h"
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/numbers/conversions.h"
@@ -30,6 +31,8 @@
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-collection-inl.h"
 #include "src/objects/js-objects.h"
+#include "src/objects/keys.h"
+#include "src/objects/property-descriptor.h"
 #include "src/objects/js-regexp.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/ordered-hash-table.h"
@@ -930,12 +933,18 @@ RdnParser<Char>::~RdnParser() {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::Parse(Isolate* isolate,
-                                           Handle<String> source) {
+                                           Handle<String> source,
+                                           Handle<Object> reviver) {
   HighAllocationThroughputScope high_throughput_scope(V8::GetCurrentPlatform());
   Handle<Object> result;
   {
     RdnParser parser(isolate, source);
     ASSIGN_RETURN_ON_EXCEPTION(isolate, result, parser.ParseRdn());
+  }
+  // Post-parse reviver pass — only when reviver is callable.
+  if (!reviver.is_null() && IsCallable(*reviver)) {
+    return RdnParseInternalizer::Internalize(isolate, result,
+                                             Cast<JSReceiver>(reviver));
   }
   return result;
 }
@@ -2309,6 +2318,29 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
       if (all_compatible) {
         Advance();  // skip '}'
         Handle<JSObject> obj = factory_->NewJSObjectFromMap(feedback);
+
+        // Allocate PropertyArray for out-of-object properties.
+        int out_of_object =
+            feedback->NextFreePropertyIndex() - feedback->GetInObjectProperties();
+        if (out_of_object > 0) {
+          DirectHandle<PropertyArray> props = factory_->NewPropertyArray(
+              out_of_object + feedback->UnusedPropertyFields());
+          obj->SetProperties(*props);
+        }
+
+        // For Double representation fields, WriteToField expects a mutable
+        // HeapNumber box in the slot (it reads the existing box and writes
+        // bits in-place). FastPropertyAtPut stores raw tagged values, so we
+        // must allocate HeapNumber boxes for Smi values beforehand.
+        for (int i = 0; i < nof_descriptors; i++) {
+          PropertyDetails details = descriptors->GetDetails(InternalIndex(i));
+          if (details.representation().IsDouble() && IsSmi(*values[i])) {
+            values[i] = factory_->NewHeapNumberFromBits(
+                base::bit_cast<uint64_t>(
+                    static_cast<double>(Object::NumberValue(*values[i]))));
+          }
+        }
+
         {
           DisallowGarbageCollection no_gc;
           Tagged<Map> raw_map = *feedback;
@@ -2603,6 +2635,34 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
       if (keys_match && all_compatible) {
         Handle<Map> map_handle(cached_map, isolate_);
         Handle<JSObject> obj = factory_->NewJSObjectFromMap(map_handle);
+
+        // Allocate PropertyArray for out-of-object properties.
+        int out_of_object =
+            map_handle->NextFreePropertyIndex() -
+            map_handle->GetInObjectProperties();
+        if (out_of_object > 0) {
+          DirectHandle<PropertyArray> props = factory_->NewPropertyArray(
+              out_of_object + map_handle->UnusedPropertyFields());
+          obj->SetProperties(*props);
+        }
+
+        // Allocate HeapNumber boxes for Smi values in Double fields.
+        {
+          Handle<DescriptorArray> desc_handle(
+              map_handle->instance_descriptors(), isolate_);
+          for (int i = 0; i < count; i++) {
+            PropertyDetails details =
+                desc_handle->GetDetails(InternalIndex(i));
+            if (details.representation().IsDouble() &&
+                IsSmi(*property_stack_[start + i].value)) {
+              property_stack_[start + i].value =
+                  factory_->NewHeapNumberFromBits(base::bit_cast<uint64_t>(
+                      static_cast<double>(Object::NumberValue(
+                          *property_stack_[start + i].value))));
+            }
+          }
+        }
+
         {
           DisallowGarbageCollection no_gc;
           Tagged<Map> raw_map = *map_handle;
@@ -3491,16 +3551,27 @@ MaybeHandle<Object> RdnParser<Char>::MakeTimeOnly(int h, int m, int s,
   if (IsMap(cached)) {
     Handle<Map> map(Cast<Map>(cached), isolate_);
     Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
-    obj->RawFastInobjectPropertyAtPut(time_only_fi_[0], Smi::FromInt(h),
-                                      SKIP_WRITE_BARRIER);
-    obj->RawFastInobjectPropertyAtPut(time_only_fi_[1], Smi::FromInt(m),
-                                      SKIP_WRITE_BARRIER);
-    obj->RawFastInobjectPropertyAtPut(time_only_fi_[2], Smi::FromInt(s),
-                                      SKIP_WRITE_BARRIER);
-    obj->RawFastInobjectPropertyAtPut(time_only_fi_[3], Smi::FromInt(ms),
-                                      SKIP_WRITE_BARRIER);
-    obj->RawFastInobjectPropertyAtPut(time_only_fi_[4],
-                                      *cached_time_only_str_);
+
+    // The Map may have more descriptors than in-object property slots (e.g. the
+    // non-enumerable __type__ tag overflows to a PropertyArray).  Allocate the
+    // backing store so FastPropertyAtPut can write out-of-object fields.
+    int out_of_object =
+        map->NextFreePropertyIndex() - map->GetInObjectProperties();
+    if (out_of_object > 0) {
+      DirectHandle<PropertyArray> props = factory_->NewPropertyArray(
+          out_of_object + map->UnusedPropertyFields());
+      obj->SetProperties(*props);
+    }
+
+    obj->FastPropertyAtPut(time_only_fi_[0], Smi::FromInt(h),
+                           SKIP_WRITE_BARRIER);
+    obj->FastPropertyAtPut(time_only_fi_[1], Smi::FromInt(m),
+                           SKIP_WRITE_BARRIER);
+    obj->FastPropertyAtPut(time_only_fi_[2], Smi::FromInt(s),
+                           SKIP_WRITE_BARRIER);
+    obj->FastPropertyAtPut(time_only_fi_[3], Smi::FromInt(ms),
+                           SKIP_WRITE_BARRIER);
+    obj->FastPropertyAtPut(time_only_fi_[4], *cached_time_only_str_);
     return obj;
   }
 
@@ -3538,9 +3609,17 @@ MaybeHandle<Object> RdnParser<Char>::MakeDuration(Handle<String> iso) {
   if (IsMap(cached)) {
     Handle<Map> map(Cast<Map>(cached), isolate_);
     Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
-    obj->RawFastInobjectPropertyAtPut(duration_fi_[0], *iso);
-    obj->RawFastInobjectPropertyAtPut(duration_fi_[1],
-                                      *cached_duration_str_);
+
+    int out_of_object =
+        map->NextFreePropertyIndex() - map->GetInObjectProperties();
+    if (out_of_object > 0) {
+      DirectHandle<PropertyArray> props = factory_->NewPropertyArray(
+          out_of_object + map->UnusedPropertyFields());
+      obj->SetProperties(*props);
+    }
+
+    obj->FastPropertyAtPut(duration_fi_[0], *iso);
+    obj->FastPropertyAtPut(duration_fi_[1], *cached_duration_str_);
     return obj;
   }
 
@@ -3557,6 +3636,226 @@ MaybeHandle<Object> RdnParser<Char>::MakeDuration(Handle<String> iso) {
     duration_fi_[i] = FieldIndex::ForDescriptor(final_map, InternalIndex(i));
   }
   return obj;
+}
+
+// ── RDN Parse Internalizer (reviver support) ──────────────────────
+// Post-parse walk that applies the reviver function bottom-up.
+// Modeled on JsonParseInternalizer but without source-text tracking,
+// and extended for Map/Set types.
+
+MaybeHandle<Object> RdnParseInternalizer::Internalize(
+    Isolate* isolate, Handle<Object> result, Handle<JSReceiver> reviver) {
+  RdnParseInternalizer internalizer(isolate, reviver);
+  Handle<JSObject> holder =
+      isolate->factory()->NewJSObject(isolate->object_function());
+  Handle<String> name = isolate->factory()->empty_string();
+  JSObject::AddProperty(isolate, holder, name, result, NONE);
+  return internalizer.InternalizeJsonProperty(holder, name);
+}
+
+MaybeHandle<Object> RdnParseInternalizer::InternalizeJsonProperty(
+    Handle<JSReceiver> holder, Handle<Object> name) {
+  HandleScope outer_scope(isolate_);
+  Handle<Object> value;
+  if (IsString(*name)) {
+    ASSIGN_RETURN_ON_EXCEPTION(
+        isolate_, value,
+        Object::GetPropertyOrElement(isolate_, holder, Cast<String>(name)));
+  } else {
+    // For Map keys that are non-string (numbers, objects, etc.)
+    // this path handles the reviver call but won't recurse into holder.
+    ASSIGN_RETURN_ON_EXCEPTION(
+        isolate_, value,
+        Object::GetPropertyOrElement(isolate_, holder, Cast<String>(name)));
+  }
+
+  if (IsJSReceiver(*value)) {
+    Handle<JSReceiver> object = Cast<JSReceiver>(value);
+
+    // Map handling.
+    if (IsJSMap(*object)) {
+      MAYBE_RETURN_NULL(InternalizeMapEntries(Cast<JSMap>(object)));
+    }
+    // Set handling.
+    else if (IsJSSet(*object)) {
+      MAYBE_RETURN_NULL(InternalizeSetEntries(Cast<JSSet>(object)));
+    }
+    // Array handling.
+    else if (IsJSArray(*object)) {
+      Handle<JSArray> array = Cast<JSArray>(object);
+      uint32_t length = 0;
+      Object::ToArrayLength(array->length(), &length);
+      for (uint32_t i = 0; i < length; i++) {
+        HandleScope inner_scope(isolate_);
+        Handle<String> index_name(
+            *isolate_->factory()->Uint32ToString(i), isolate_);
+        if (!RecurseAndApply(object, index_name)) {
+          return MaybeHandle<Object>();
+        }
+      }
+    }
+    // Object handling.
+    else {
+      Handle<FixedArray> contents;
+      ASSIGN_RETURN_ON_EXCEPTION(
+          isolate_, contents,
+          KeyAccumulator::GetKeys(isolate_, object,
+                                  KeyCollectionMode::kOwnOnly,
+                                  ENUMERABLE_STRINGS,
+                                  GetKeysConversion::kConvertToString));
+      for (int i = 0; i < contents->length(); i++) {
+        HandleScope inner_scope(isolate_);
+        Handle<String> key_name(Cast<String>(contents->get(i)), isolate_);
+        if (!RecurseAndApply(object, key_name)) {
+          return MaybeHandle<Object>();
+        }
+      }
+    }
+  }
+
+  // Call reviver.call(holder, name, value).
+  DirectHandle<Object> argv[] = {name, value};
+  Handle<Object> result;
+  ASSIGN_RETURN_ON_EXCEPTION(
+      isolate_, result,
+      Execution::Call(isolate_, reviver_, holder, base::VectorOf(argv, 2)));
+  return outer_scope.CloseAndEscape(result);
+}
+
+bool RdnParseInternalizer::RecurseAndApply(Handle<JSReceiver> holder,
+                                           Handle<String> name) {
+  STACK_CHECK(isolate_, false);
+  Handle<Object> result;
+  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+      isolate_, result, InternalizeJsonProperty(holder, name), false);
+  Maybe<bool> change_result = Nothing<bool>();
+  if (IsUndefined(*result, isolate_)) {
+    change_result = JSReceiver::DeletePropertyOrElement(
+        isolate_, holder, name, LanguageMode::kSloppy);
+  } else {
+    PropertyDescriptor desc;
+    desc.set_value(Cast<JSAny>(result));
+    desc.set_configurable(true);
+    desc.set_enumerable(true);
+    desc.set_writable(true);
+    change_result = JSReceiver::DefineOwnProperty(isolate_, holder, name, &desc,
+                                                  Just(kDontThrow));
+  }
+  MAYBE_RETURN(change_result, false);
+  return true;
+}
+
+Maybe<bool> RdnParseInternalizer::InternalizeMapEntries(Handle<JSMap> map) {
+  // Collect all entries first (can't modify while iterating).
+  Tagged<OrderedHashMap> table = Cast<OrderedHashMap>(map->table());
+  ReadOnlyRoots roots(isolate_);
+  std::vector<std::pair<Handle<Object>, Handle<Object>>> entries;
+  for (InternalIndex i : table->IterateEntries()) {
+    Tagged<Object> raw_key;
+    if (!table->ToKey(roots, i, &raw_key)) continue;
+    Handle<Object> key(raw_key, isolate_);
+    Handle<Object> value(table->ValueAt(i), isolate_);
+    entries.push_back({key, value});
+    table = Cast<OrderedHashMap>(map->table());
+  }
+
+  // Recursively revive subtrees and apply reviver per entry.
+  Handle<OrderedHashMap> new_table =
+      OrderedHashMap::Allocate(isolate_, static_cast<int>(entries.size()))
+          .ToHandleChecked();
+
+  for (auto& [map_key, map_value] : entries) {
+    // Recursively revive key subtree if it's a JSReceiver.
+    Handle<Object> revived_key = map_key;
+    if (IsJSReceiver(*map_key)) {
+      Handle<JSObject> key_holder =
+          isolate_->factory()->NewJSObject(isolate_->object_function());
+      Handle<String> key_name = isolate_->factory()->empty_string();
+      JSObject::AddProperty(isolate_, key_holder, key_name, map_key, NONE);
+      ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+          isolate_, revived_key, InternalizeJsonProperty(key_holder, key_name),
+          Nothing<bool>());
+    }
+
+    // Recursively revive value subtree if it's a JSReceiver.
+    Handle<Object> revived_value = map_value;
+    if (IsJSReceiver(*map_value)) {
+      Handle<JSObject> val_holder =
+          isolate_->factory()->NewJSObject(isolate_->object_function());
+      Handle<String> val_name = isolate_->factory()->empty_string();
+      JSObject::AddProperty(isolate_, val_holder, val_name, map_value, NONE);
+      ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+          isolate_, revived_value, InternalizeJsonProperty(val_holder, val_name),
+          Nothing<bool>());
+    }
+
+    // Call reviver.call(map, key, value) — key is actual map key (any type).
+    DirectHandle<Object> argv[] = {revived_key, revived_value};
+    Handle<Object> replaced;
+    ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+        isolate_, replaced,
+        Execution::Call(isolate_, reviver_, map, base::VectorOf(argv, 2)),
+        Nothing<bool>());
+    if (!IsUndefined(*replaced, isolate_)) {
+      new_table = OrderedHashMap::Add(isolate_, new_table, revived_key,
+                                      replaced)
+                      .ToHandleChecked();
+    }
+  }
+
+  // Replace the map's internal table.
+  map->set_table(*new_table);
+  return Just(true);
+}
+
+Maybe<bool> RdnParseInternalizer::InternalizeSetEntries(Handle<JSSet> set) {
+  // Collect all elements first.
+  Tagged<OrderedHashSet> table = Cast<OrderedHashSet>(set->table());
+  ReadOnlyRoots roots(isolate_);
+  std::vector<Handle<Object>> elements;
+  for (InternalIndex i : table->IterateEntries()) {
+    Tagged<Object> raw_key;
+    if (!table->ToKey(roots, i, &raw_key)) continue;
+    elements.push_back(handle(raw_key, isolate_));
+    table = Cast<OrderedHashSet>(set->table());
+  }
+
+  // Apply reviver per element.
+  Handle<OrderedHashSet> new_table =
+      OrderedHashSet::Allocate(isolate_, static_cast<int>(elements.size()))
+          .ToHandleChecked();
+
+  for (int idx = 0; idx < static_cast<int>(elements.size()); idx++) {
+    Handle<Object> element = elements[idx];
+
+    // Recursively revive subtree if it's a JSReceiver.
+    if (IsJSReceiver(*element)) {
+      Handle<JSObject> elem_holder =
+          isolate_->factory()->NewJSObject(isolate_->object_function());
+      Handle<String> elem_name = isolate_->factory()->empty_string();
+      JSObject::AddProperty(isolate_, elem_holder, elem_name, element, NONE);
+      ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+          isolate_, element, InternalizeJsonProperty(elem_holder, elem_name),
+          Nothing<bool>());
+    }
+
+    // Call reviver.call(set, String(index), element).
+    DirectHandle<String> index_str = isolate_->factory()->Uint32ToString(idx);
+    DirectHandle<Object> argv[] = {index_str, element};
+    Handle<Object> replaced;
+    ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+        isolate_, replaced,
+        Execution::Call(isolate_, reviver_, set, base::VectorOf(argv, 2)),
+        Nothing<bool>());
+    if (!IsUndefined(*replaced, isolate_)) {
+      new_table =
+          OrderedHashSet::Add(isolate_, new_table, replaced).ToHandleChecked();
+    }
+  }
+
+  // Replace the set's internal table.
+  set->set_table(*new_table);
+  return Just(true);
 }
 
 // ── Template instantiations ───────────────────────────────────────

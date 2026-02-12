@@ -605,3 +605,245 @@ assertThrows(() => RDN.parse('{"key":'), SyntaxError);
   assertEquals(null, arr2[3]);
   assertEquals(5, arr2[4]);
 }
+
+// ── Replacer tests ──────────────────────────────────────────────────
+
+// Object property filtering (return undefined to omit)
+{
+  const obj = {a: 1, b: 2, c: 3};
+  const s = RDN.stringify(obj, (key, value) => key === "b" ? undefined : value);
+  const result = RDN.parse(s);
+  assertEquals(1, result.a);
+  assertEquals(3, result.c);
+  assertEquals(undefined, result.b);
+}
+
+// Array element transformation
+{
+  const arr = [1, 2, 3, 4];
+  const s = RDN.stringify(arr, (key, value) => typeof value === "number" ? value * 2 : value);
+  const result = RDN.parse(s);
+  assertEquals([2, 4, 6, 8], result);
+}
+
+// Root-level replacement (key="")
+{
+  const s = RDN.stringify(42, (key, value) => {
+    if (key === "") return "replaced";
+    return value;
+  });
+  assertEquals('"replaced"', s);
+}
+
+// Map entry filtering with simple keys
+{
+  const m = new Map([["a", 1], ["b", 2], ["c", 3]]);
+  const s = RDN.stringify(m, (key, value) => key === "b" ? undefined : value);
+  const result = RDN.parse(s);
+  assertTrue(result instanceof Map);
+  assertEquals(2, result.size);
+  assertEquals(1, result.get("a"));
+  assertEquals(3, result.get("c"));
+  assertFalse(result.has("b"));
+}
+
+// Map entry filtering with numeric keys
+{
+  const m = new Map([[1, "one"], [2, "two"], [3, "three"]]);
+  const s = RDN.stringify(m, (key, value) => key === 2 ? undefined : value);
+  const result = RDN.parse(s);
+  assertTrue(result instanceof Map);
+  assertEquals(2, result.size);
+  assertEquals("one", result.get(1));
+  assertEquals("three", result.get(3));
+}
+
+// Set element filtering
+{
+  const s = new Set([1, 2, 3, 4, 5]);
+  const str = RDN.stringify(s, (key, value) => value % 2 === 0 ? undefined : value);
+  const result = RDN.parse(str);
+  assertTrue(result instanceof Set);
+  assertEquals(3, result.size);
+  assertTrue(result.has(1));
+  assertTrue(result.has(3));
+  assertTrue(result.has(5));
+}
+
+// All-filtered Map → Map{}
+{
+  const m = new Map([["a", 1]]);
+  const s = RDN.stringify(m, (key, value) => typeof value === "number" ? undefined : value);
+  assertEquals("Map{}", s);
+}
+
+// All-filtered Set → Set{}
+{
+  const s = new Set([1, 2, 3]);
+  const str = RDN.stringify(s, (key, value) => typeof value === "number" ? undefined : value);
+  assertEquals("Set{}", str);
+}
+
+// Non-callable replacer → ignored (no filtering)
+{
+  const obj = {a: 1, b: 2};
+  const s1 = RDN.stringify(obj);
+  const s2 = RDN.stringify(obj, null);
+  const s3 = RDN.stringify(obj, 42);
+  const s4 = RDN.stringify(obj, "not a function");
+  assertEquals(s1, s2);
+  assertEquals(s1, s3);
+  assertEquals(s1, s4);
+}
+
+// Nested structures with replacer
+{
+  const obj = {a: {x: 1, y: 2}, b: {x: 3, y: 4}};
+  const s = RDN.stringify(obj, (key, value) => key === "y" ? undefined : value);
+  const result = RDN.parse(s);
+  assertEquals(1, result.a.x);
+  assertEquals(undefined, result.a.y);
+  assertEquals(3, result.b.x);
+  assertEquals(undefined, result.b.y);
+}
+
+// Replacer value transformation on objects
+{
+  const obj = {name: "test", count: 5};
+  const s = RDN.stringify(obj, (key, value) => {
+    if (typeof value === "string" && key !== "") return value.toUpperCase();
+    return value;
+  });
+  const result = RDN.parse(s);
+  assertEquals("TEST", result.name);
+  assertEquals(5, result.count);
+}
+
+// ── Reviver tests ───────────────────────────────────────────────────
+
+// Object value transformation
+{
+  const result = RDN.parse('{"a": 1, "b": 2, "c": 3}', (key, value) => {
+    if (typeof value === "number") return value * 10;
+    return value;
+  });
+  assertEquals(10, result.a);
+  assertEquals(20, result.b);
+  assertEquals(30, result.c);
+}
+
+// Object property deletion (return undefined)
+{
+  const result = RDN.parse('{"a": 1, "b": 2, "c": 3}', (key, value) => {
+    if (key === "b") return undefined;
+    return value;
+  });
+  assertEquals(1, result.a);
+  assertEquals(undefined, result.b);
+  assertEquals(3, result.c);
+}
+
+// Array element transformation
+{
+  const result = RDN.parse('[1, 2, 3]', (key, value) => {
+    if (typeof value === "number") return value + 100;
+    return value;
+  });
+  assertEquals([101, 102, 103], result);
+}
+
+// Map value transformation with simple keys
+{
+  const result = RDN.parse('Map{"a" => 1, "b" => 2}', (key, value) => {
+    if (typeof value === "number") return value * 5;
+    return value;
+  });
+  assertTrue(result instanceof Map);
+  assertEquals(5, result.get("a"));
+  assertEquals(10, result.get("b"));
+}
+
+// Map entry removal (return undefined for map entry)
+{
+  const result = RDN.parse('Map{"a" => 1, "b" => 2, "c" => 3}', (key, value) => {
+    if (key === "b") return undefined;
+    return value;
+  });
+  assertTrue(result instanceof Map);
+  assertEquals(2, result.size);
+  assertEquals(1, result.get("a"));
+  assertEquals(3, result.get("c"));
+  assertFalse(result.has("b"));
+}
+
+// Set value transformation
+{
+  const result = RDN.parse('Set{1, 2, 3}', (key, value) => {
+    if (typeof value === "number") return value * 10;
+    return value;
+  });
+  assertTrue(result instanceof Set);
+  assertEquals(3, result.size);
+  assertTrue(result.has(10));
+  assertTrue(result.has(20));
+  assertTrue(result.has(30));
+}
+
+// Set element removal (return undefined)
+{
+  const result = RDN.parse('Set{1, 2, 3, 4, 5}', (key, value) => {
+    if (value === 3) return undefined;
+    return value;
+  });
+  assertTrue(result instanceof Set);
+  assertEquals(4, result.size);
+  assertTrue(result.has(1));
+  assertTrue(result.has(2));
+  assertFalse(result.has(3));
+  assertTrue(result.has(4));
+  assertTrue(result.has(5));
+}
+
+// Non-callable reviver → ignored
+{
+  const result1 = RDN.parse('{"a": 1}');
+  const result2 = RDN.parse('{"a": 1}', null);
+  const result3 = RDN.parse('{"a": 1}', 42);
+  assertEquals(result1.a, result2.a);
+  assertEquals(result1.a, result3.a);
+}
+
+// Nested structures with reviver (bottom-up order)
+{
+  const order = [];
+  RDN.parse('{"a": {"x": 1}, "b": 2}', (key, value) => {
+    if (key !== "") order.push(key);
+    return value;
+  });
+  // Bottom-up: inner properties first, then outer
+  assertEquals("x", order[0]);
+  assertEquals("a", order[1]);
+  assertEquals("b", order[2]);
+}
+
+// Roundtrip with replacer + reviver
+{
+  const original = {a: 1, b: 2, c: 3};
+  // Replacer doubles values
+  const encoded = RDN.stringify(original, (key, value) => {
+    if (typeof value === "number") return value * 2;
+    return value;
+  });
+  // Reviver halves them back
+  const decoded = RDN.parse(encoded, (key, value) => {
+    if (typeof value === "number") return value / 2;
+    return value;
+  });
+  assertEquals(1, decoded.a);
+  assertEquals(2, decoded.b);
+  assertEquals(3, decoded.c);
+}
+
+// RDN.parse.length and RDN.stringify.length should be 2
+assertEquals(2, RDN.parse.length);
+assertEquals(2, RDN.stringify.length);
