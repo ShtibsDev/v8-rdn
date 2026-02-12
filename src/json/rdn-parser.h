@@ -9,6 +9,7 @@
 #include "src/base/strings.h"
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
+#include "src/objects/field-index.h"
 #include "src/objects/objects.h"
 #include "src/objects/string.h"
 
@@ -261,6 +262,42 @@ class RdnParser final {
   // Whether the map cache has ever been populated. Skips the 4-entry linear
   // scan in ParseBrace when all entries are empty.
   bool map_cache_populated_ = false;
+
+  // ── Cached maps + field indices for TimeOnly / Duration construction ──
+  // Maps are stored in a GC-traced FixedArray (not raw Handle<Map>) because
+  // handles cached inside nested HandleScopes become dangling when the scope
+  // closes via CloseAndEscape. The FixedArray is allocated in the parser
+  // constructor and survives all nested scopes.
+  // Slot 0 = TimeOnly map, Slot 1 = Duration map.
+  static constexpr int kTypeCacheTimeOnly = 0;
+  static constexpr int kTypeCacheDuration = 1;
+  static constexpr int kTypeCacheSize = 2;
+  Handle<FixedArray> type_map_cache_;
+  FieldIndex time_only_fi_[5];  // hours, minutes, seconds, ms, __type__
+  FieldIndex duration_fi_[2];  // iso, __type__
+  // Internalized key strings — allocated once, reused across all calls.
+  Handle<String> cached_hours_key_;
+  Handle<String> cached_minutes_key_;
+  Handle<String> cached_seconds_key_;
+  Handle<String> cached_ms_key_;
+  Handle<String> cached_type_key_;
+  Handle<String> cached_time_only_str_;
+  Handle<String> cached_iso_key_;
+  Handle<String> cached_duration_str_;
+  bool time_keys_initialized_ = false;
+
+  void EnsureTimeKeysInitialized() {
+    if (time_keys_initialized_) return;
+    time_keys_initialized_ = true;
+    cached_hours_key_ = factory_->InternalizeUtf8String("hours");
+    cached_minutes_key_ = factory_->InternalizeUtf8String("minutes");
+    cached_seconds_key_ = factory_->InternalizeUtf8String("seconds");
+    cached_ms_key_ = factory_->InternalizeUtf8String("milliseconds");
+    cached_type_key_ = factory_->InternalizeUtf8String("__type__");
+    cached_time_only_str_ = factory_->InternalizeUtf8String("TimeOnly");
+    cached_iso_key_ = factory_->InternalizeUtf8String("iso");
+    cached_duration_str_ = factory_->InternalizeUtf8String("Duration");
+  }
 };
 
 extern template class RdnParser<uint8_t>;

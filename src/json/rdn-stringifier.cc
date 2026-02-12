@@ -9,6 +9,7 @@
 
 #include "src/json/rdn-stringifier.h"
 
+#include <cinttypes>
 #include <cmath>
 #include <string_view>
 
@@ -29,6 +30,7 @@
 #include "src/objects/objects-inl.h"
 #include "src/objects/ordered-hash-table.h"
 #include "src/objects/smi.h"
+#include "src/objects/field-index-inl.h"
 #include "src/execution/protectors-inl.h"
 #include "src/strings/string-builder-inl.h"
 #include "src/base/small-vector.h"
@@ -47,6 +49,71 @@ namespace {
 
 static const char kBase64Table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// ── Digit-pair table for fast numeric formatting ────────────────────
+// Pre-computed pairs "00", "01", ..., "99" for direct 2-char writes.
+// Used by date/time formatting to avoid snprintf overhead.
+static constexpr char kDigitPairs[200] = {
+    '0', '0', '0', '1', '0', '2', '0', '3', '0', '4', '0', '5', '0', '6',
+    '0', '7', '0', '8', '0', '9', '1', '0', '1', '1', '1', '2', '1', '3',
+    '1', '4', '1', '5', '1', '6', '1', '7', '1', '8', '1', '9', '2', '0',
+    '2', '1', '2', '2', '2', '3', '2', '4', '2', '5', '2', '6', '2', '7',
+    '2', '8', '2', '9', '3', '0', '3', '1', '3', '2', '3', '3', '3', '4',
+    '3', '5', '3', '6', '3', '7', '3', '8', '3', '9', '4', '0', '4', '1',
+    '4', '2', '4', '3', '4', '4', '4', '5', '4', '6', '4', '7', '4', '8',
+    '4', '9', '5', '0', '5', '1', '5', '2', '5', '3', '5', '4', '5', '5',
+    '5', '6', '5', '7', '5', '8', '5', '9', '6', '0', '6', '1', '6', '2',
+    '6', '3', '6', '4', '6', '5', '6', '6', '6', '7', '6', '8', '6', '9',
+    '7', '0', '7', '1', '7', '2', '7', '3', '7', '4', '7', '5', '7', '6',
+    '7', '7', '7', '8', '7', '9', '8', '0', '8', '1', '8', '2', '8', '3',
+    '8', '4', '8', '5', '8', '6', '8', '7', '8', '8', '8', '9', '9', '0',
+    '9', '1', '9', '2', '9', '3', '9', '4', '9', '5', '9', '6', '9', '7',
+    '9', '8', '9', '9',
+};
+
+// Write a 2-digit zero-padded number to buf using the digit-pair table.
+V8_INLINE void WriteDigitPair(char* buf, int value) {
+  DCHECK_GE(value, 0);
+  DCHECK_LT(value, 100);
+  memcpy(buf, &kDigitPairs[value * 2], 2);
+}
+
+// Write a 4-digit zero-padded year to buf.
+V8_INLINE void WriteYear(char* buf, int year) {
+  DCHECK_GE(year, 0);
+  DCHECK_LT(year, 10000);
+  WriteDigitPair(buf, year / 100);
+  WriteDigitPair(buf + 2, year % 100);
+}
+
+// Write a 3-digit zero-padded millisecond to buf.
+V8_INLINE void WriteMillis(char* buf, int ms) {
+  DCHECK_GE(ms, 0);
+  DCHECK_LT(ms, 1000);
+  buf[0] = '0' + ms / 100;
+  WriteDigitPair(buf + 1, ms % 100);
+}
+
+// Format a date-time as "@YYYY-MM-DDTHH:mm:ss.sssZ" (exactly 25 chars)
+// directly into buf using digit-pair lookups. No snprintf overhead.
+V8_INLINE void FormatDateDirect(char* buf, int year, int month, int day,
+                                int hour, int min, int sec, int ms) {
+  buf[0] = '@';
+  WriteYear(buf + 1, year);
+  buf[5] = '-';
+  WriteDigitPair(buf + 6, month);
+  buf[8] = '-';
+  WriteDigitPair(buf + 9, day);
+  buf[11] = 'T';
+  WriteDigitPair(buf + 12, hour);
+  buf[14] = ':';
+  WriteDigitPair(buf + 15, min);
+  buf[17] = ':';
+  WriteDigitPair(buf + 18, sec);
+  buf[20] = '.';
+  WriteMillis(buf + 21, ms);
+  buf[24] = 'Z';
+}
 
 // ── Escape table (from json-stringifier.cc) ────────────────────────
 // Translation table to escape Latin1 characters.
@@ -559,6 +626,12 @@ class RdnStringifier {
   Handle<String> ms_key_;         // "milliseconds"
   Handle<String> iso_key_;        // "iso"
 
+  // Cached maps for O(1) TimeOnly/Duration detection.
+  // After first successful detection, we cache the map so subsequent
+  // checks are a simple pointer comparison instead of property lookups.
+  Handle<Map> cached_time_only_map_;
+  Handle<Map> cached_duration_map_;
+
   void EnsureTimeTypeStringsInitialized() {
     if (time_strings_initialized_) return;
     time_strings_initialized_ = true;
@@ -1020,8 +1093,69 @@ bool RdnStringifier::SerializeJSArray(Handle<JSArray> array) {
       }
       break;
     }
+    case HOLEY_SMI_ELEMENTS: {
+      // Fast path for holey Smi arrays when no-elements protector is intact.
+      if (!Protectors::IsNoElementsIntact(isolate_)) goto slow_path;
+      DisallowGarbageCollection no_gc;
+      Tagged<FixedArray> elements = Cast<FixedArray>(array->elements());
+      for (uint32_t i = 0; i < length; i++) {
+        if (i > 0) AppendCharacter(',');
+        Tagged<Object> element = elements->get(i);
+        if (IsTheHole(element, isolate_)) {
+          AppendCStringLiteral("null");
+        } else {
+          SerializeSmi(Cast<Smi>(element));
+        }
+      }
+      break;
+    }
+    case HOLEY_DOUBLE_ELEMENTS: {
+      if (!Protectors::IsNoElementsIntact(isolate_)) goto slow_path;
+      DisallowGarbageCollection no_gc;
+      Tagged<FixedDoubleArray> elements =
+          Cast<FixedDoubleArray>(array->elements());
+      for (uint32_t i = 0; i < length; i++) {
+        if (i > 0) AppendCharacter(',');
+        if (elements->is_the_hole(i)) {
+          AppendCStringLiteral("null");
+        } else {
+          SerializeDouble(elements->get_scalar(i));
+        }
+      }
+      break;
+    }
+    case HOLEY_ELEMENTS: {
+      if (!Protectors::IsNoElementsIntact(isolate_)) goto slow_path;
+      Tagged<FixedArray> elems = Cast<FixedArray>(array->elements());
+      for (uint32_t i = 0; i < length; i++) {
+        if (i > 0) AppendCharacter(',');
+        Tagged<Object> element = elems->get(i);
+        if (IsTheHole(element, isolate_)) {
+          AppendCStringLiteral("null");
+          continue;
+        }
+        if (IsSmi(element)) {
+          SerializeSmi(Cast<Smi>(element));
+          continue;
+        }
+        if (IsUndefined(element, isolate_) || IsJSFunction(element) ||
+            IsSymbol(element)) {
+          AppendCStringLiteral("null");
+          continue;
+        }
+        Handle<Object> elem(element, isolate_);
+        if (!SerializeValue(elem)) {
+          StackPop();
+          return false;
+        }
+        elems = Cast<FixedArray>(array->elements());
+      }
+      break;
+    }
     default: {
-      // Slow path: use GetElement for holey/dictionary arrays.
+    slow_path:
+      // Slow path: use GetElement for dictionary arrays or when
+      // no-elements protector is not intact.
       for (uint32_t i = 0; i < length; i++) {
         if (i > 0) AppendCharacter(',');
         Handle<Object> element;
@@ -1261,14 +1395,12 @@ bool RdnStringifier::SerializeJSDate(Handle<JSDate> date) {
   int month = static_cast<int>(m);
   int day = static_cast<int>(d);
 
-  AppendCharacter('@');
-
-  // Format: YYYY-MM-DDTHH:mm:ss.sssZ (always include milliseconds
+  // Format: @YYYY-MM-DDTHH:mm:ss.sssZ (always include milliseconds
   // to match JS Date.toISOString() and ensure roundtrip fidelity).
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-           year, month, day, hour, min, sec, ms);
-  AppendCString(buf);
+  // Direct digit-pair writing: ~10ns vs ~100-200ns for snprintf.
+  char buf[25];
+  FormatDateDirect(buf, year, month, day, hour, min, sec, ms);
+  for (int i = 0; i < 25; i++) AppendCharacter(buf[i]);
   return true;
 }
 
@@ -1318,8 +1450,19 @@ bool RdnStringifier::SerializeJSMap(Handle<JSMap> map) {
     if (!first) AppendCharacter(',');
     first = false;
 
+    Tagged<Object> raw_value = table->ValueAt(i);
+
+    // Inline Smi fast path: serialize Smi keys/values directly without
+    // Handle allocation or SerializeValue dispatch overhead.
+    if (IsSmi(raw_key) && IsSmi(raw_value)) {
+      SerializeSmi(Cast<Smi>(raw_key));
+      AppendCStringLiteral("=>");
+      SerializeSmi(Cast<Smi>(raw_value));
+      continue;
+    }
+
     Handle<Object> key(raw_key, isolate_);
-    Handle<Object> value(table->ValueAt(i), isolate_);
+    Handle<Object> value(raw_value, isolate_);
 
     if (!SerializeValue(key)) { StackPop(); return false; }
     AppendCStringLiteral("=>");
@@ -1375,8 +1518,22 @@ bool RdnStringifier::SerializeJSTypedArray(Handle<JSTypedArray> array) {
   size_t byte_length = array->byte_length();
   const uint8_t* data = static_cast<const uint8_t*>(array->DataPtr());
 
+  // Pre-compute output size and ensure buffer capacity once.
+  // base64 output: 4 chars per 3 bytes, rounded up, + b"..." wrapper = 3 chars.
+  size_t b64_len = (byte_length + 2) / 3 * 4;
+  size_t total_len = b64_len + 3;  // b" + encoded + "
+
+  // Ensure buffer has space for the entire output.
+  while (!CurrentPartCanFit(total_len + 1)) {
+    Extend();
+    if (V8_UNLIKELY(overflowed_)) return false;
+  }
+
   AppendCStringLiteral("b\"");
 
+  // Batched writes: encode 3 bytes → 4 chars directly via lookup table.
+  // Buffer capacity is already ensured, so individual AppendCharacter
+  // branch checks are the only overhead remaining.
   size_t i = 0;
   while (i + 2 < byte_length) {
     uint32_t triplet = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
@@ -1387,6 +1544,7 @@ bool RdnStringifier::SerializeJSTypedArray(Handle<JSTypedArray> array) {
     i += 3;
   }
 
+  // Handle remaining 1 or 2 bytes.
   if (i + 1 == byte_length) {
     uint32_t val = data[i] << 16;
     AppendCharacter(kBase64Table[(val >> 18) & 0x3F]);
@@ -1409,34 +1567,76 @@ bool RdnStringifier::SerializeJSTypedArray(Handle<JSTypedArray> array) {
 
 bool RdnStringifier::IsTimeOnly(Handle<JSObject> object) {
   EnsureTimeTypeStringsInitialized();
+  // Fast path: O(1) map identity check if we've cached the TimeOnly map.
+  if (!cached_time_only_map_.is_null() &&
+      object->map() == *cached_time_only_map_) {
+    return true;
+  }
+  // Slow path: property-based detection (first encounter).
   Handle<Object> type_val;
   MaybeHandle<Object> maybe_type =
       Object::GetProperty(isolate_, object, type_key_);
   if (!maybe_type.ToHandle(&type_val) || !IsString(*type_val)) return false;
-  return String::Equals(isolate_, Cast<String>(type_val), time_only_str_);
+  if (!String::Equals(isolate_, Cast<String>(type_val), time_only_str_)) {
+    return false;
+  }
+  // Cache the map for subsequent O(1) detection.
+  if (cached_time_only_map_.is_null()) {
+    cached_time_only_map_ = handle(object->map(), isolate_);
+  }
+  return true;
 }
 
 bool RdnStringifier::SerializeTimeOnly(Handle<JSObject> object) {
-  Handle<Object> h_val, m_val, s_val, ms_val;
-  USE(Object::GetProperty(isolate_, object, hours_key_).ToHandle(&h_val));
-  USE(Object::GetProperty(isolate_, object, minutes_key_).ToHandle(&m_val));
-  USE(Object::GetProperty(isolate_, object, seconds_key_).ToHandle(&s_val));
-  USE(Object::GetProperty(isolate_, object, ms_key_).ToHandle(&ms_val));
+  int h, m, s, ms;
 
-  int h = IsSmi(*h_val) ? Smi::ToInt(*h_val) : 0;
-  int m = IsSmi(*m_val) ? Smi::ToInt(*m_val) : 0;
-  int s = IsSmi(*s_val) ? Smi::ToInt(*s_val) : 0;
-  int ms = IsSmi(*ms_val) ? Smi::ToInt(*ms_val) : 0;
-
-  char buf[16];
-  snprintf(buf, sizeof(buf), "@%02d:%02d:%02d", h, m, s);
-  AppendCString(buf);
-
-  if (ms > 0) {
-    char ms_buf[8];
-    snprintf(ms_buf, sizeof(ms_buf), ".%03d", ms);
-    AppendCString(ms_buf);
+  // Fast path: if map is cached, read Smi fields at known offsets via
+  // direct field access — no property lookups needed.
+  if (!cached_time_only_map_.is_null() &&
+      object->map() == *cached_time_only_map_ &&
+      object->HasFastProperties()) {
+    Tagged<Map> map = object->map();
+    // Fields: hours(0), minutes(1), seconds(2), milliseconds(3).
+    Tagged<Object> h_raw = object->RawFastPropertyAt(
+        FieldIndex::ForPropertyIndex(map, 0, Representation::Tagged()));
+    Tagged<Object> m_raw = object->RawFastPropertyAt(
+        FieldIndex::ForPropertyIndex(map, 1, Representation::Tagged()));
+    Tagged<Object> s_raw = object->RawFastPropertyAt(
+        FieldIndex::ForPropertyIndex(map, 2, Representation::Tagged()));
+    Tagged<Object> ms_raw = object->RawFastPropertyAt(
+        FieldIndex::ForPropertyIndex(map, 3, Representation::Tagged()));
+    h = IsSmi(h_raw) ? Smi::ToInt(h_raw) : 0;
+    m = IsSmi(m_raw) ? Smi::ToInt(m_raw) : 0;
+    s = IsSmi(s_raw) ? Smi::ToInt(s_raw) : 0;
+    ms = IsSmi(ms_raw) ? Smi::ToInt(ms_raw) : 0;
+  } else {
+    // Fallback: property-based access.
+    Handle<Object> h_val, m_val, s_val, ms_val;
+    USE(Object::GetProperty(isolate_, object, hours_key_).ToHandle(&h_val));
+    USE(Object::GetProperty(isolate_, object, minutes_key_).ToHandle(&m_val));
+    USE(Object::GetProperty(isolate_, object, seconds_key_).ToHandle(&s_val));
+    USE(Object::GetProperty(isolate_, object, ms_key_).ToHandle(&ms_val));
+    h = IsSmi(*h_val) ? Smi::ToInt(*h_val) : 0;
+    m = IsSmi(*m_val) ? Smi::ToInt(*m_val) : 0;
+    s = IsSmi(*s_val) ? Smi::ToInt(*s_val) : 0;
+    ms = IsSmi(*ms_val) ? Smi::ToInt(*ms_val) : 0;
   }
+
+  // Direct digit-pair writing for time: @HH:MM:SS[.mmm]
+  char buf[13];  // max: @HH:MM:SS.mmm = 13 chars
+  buf[0] = '@';
+  WriteDigitPair(buf + 1, h);
+  buf[3] = ':';
+  WriteDigitPair(buf + 4, m);
+  buf[6] = ':';
+  WriteDigitPair(buf + 7, s);
+  int len = 9;
+  if (ms > 0) {
+    buf[9] = '.';
+    WriteMillis(buf + 10, ms);
+    len = 13;
+  }
+  for (int i = 0; i < len; i++) AppendCharacter(buf[i]);
 
   return true;
 }
@@ -1445,14 +1645,43 @@ bool RdnStringifier::SerializeTimeOnly(Handle<JSObject> object) {
 
 bool RdnStringifier::IsDuration(Handle<JSObject> object) {
   EnsureTimeTypeStringsInitialized();
+  // Fast path: O(1) map identity check.
+  if (!cached_duration_map_.is_null() &&
+      object->map() == *cached_duration_map_) {
+    return true;
+  }
+  // Slow path: property-based detection.
   Handle<Object> type_val;
   MaybeHandle<Object> maybe_type =
       Object::GetProperty(isolate_, object, type_key_);
   if (!maybe_type.ToHandle(&type_val) || !IsString(*type_val)) return false;
-  return String::Equals(isolate_, Cast<String>(type_val), duration_str_);
+  if (!String::Equals(isolate_, Cast<String>(type_val), duration_str_)) {
+    return false;
+  }
+  // Cache the map for subsequent O(1) detection.
+  if (cached_duration_map_.is_null()) {
+    cached_duration_map_ = handle(object->map(), isolate_);
+  }
+  return true;
 }
 
 bool RdnStringifier::SerializeDuration(Handle<JSObject> object) {
+  // Fast path: direct field access when map is cached.
+  if (!cached_duration_map_.is_null() &&
+      object->map() == *cached_duration_map_ &&
+      object->HasFastProperties()) {
+    Tagged<Map> map = object->map();
+    // Fields: iso(0).
+    Tagged<Object> iso_raw = object->RawFastPropertyAt(
+        FieldIndex::ForPropertyIndex(map, 0, Representation::Tagged()));
+    AppendCharacter('@');
+    if (IsString(iso_raw)) {
+      AppendString(handle(Cast<String>(iso_raw), isolate_));
+    }
+    return true;
+  }
+
+  // Fallback: property-based access.
   Handle<Object> iso_val;
   USE(Object::GetProperty(isolate_, object, iso_key_).ToHandle(&iso_val));
 
@@ -2033,11 +2262,12 @@ void FastRdnStringifier<Char>::SerializeDate(Tagged<JSDate> date) {
   unsigned d = doy - (153 * mp + 2) / 5 + 1;
   unsigned m = mp < 10 ? mp + 3 : mp - 9;
   if (m <= 2) y++;
-  // @YYYY-MM-DDTHH:mm:ss.sssZ = 25 chars max
-  char buf[32];
-  snprintf(buf, sizeof(buf), "@%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-           y, static_cast<int>(m), static_cast<int>(d), hour, min, sec, ms);
-  AppendCString(buf, strlen(buf));
+  // @YYYY-MM-DDTHH:mm:ss.sssZ = exactly 25 chars.
+  // Direct digit-pair writing: ~10ns vs ~100-200ns for snprintf.
+  char buf[25];
+  FormatDateDirect(buf, y, static_cast<int>(m), static_cast<int>(d),
+                   hour, min, sec, ms);
+  AppendCString(buf, 25);
 }
 
 // ── String serialization (SIMD/SWAR/Scalar with RdnEscapeTable) ──
@@ -2423,8 +2653,75 @@ FastRdnStringifierResult FastRdnStringifier<Char>::TrySerializeSimpleObject(
       return JS_OBJECT;
     case JS_ARRAY_TYPE:
       return JS_ARRAY;
+    case BIGINT_TYPE: {
+      // RDN: Serialize small BigInts directly via IntToStringView + 'n'.
+      // Falls to SLOW_PATH for large BigInts that don't fit in int64.
+      Tagged<BigInt> bigint = Cast<BigInt>(obj);
+      bool lossless = false;
+      int64_t value = bigint->AsInt64(&lossless);
+      if (lossless) {
+        static constexpr uint32_t kBigIntBufferSize =
+            sizeof("-9223372036854775808") - 1;
+        char chars[kBigIntBufferSize];
+        base::Vector<char> buf(chars, kBigIntBufferSize);
+        // Use snprintf for int64_t since IntToStringView only handles int.
+        int len = snprintf(chars, kBigIntBufferSize, "%" PRId64, value);
+        AppendCString(chars, len);
+        AppendCharacter('n');
+        return SUCCESS;
+      }
+      return SLOW_PATH;
+    }
+    case JS_REG_EXP_TYPE: {
+      // RDN: GC-free RegExp serialization — read source() and flags()
+      // directly from the JSRegExp object.
+      Tagged<JSRegExp> regexp = Cast<JSRegExp>(obj);
+      Tagged<String> source = regexp->source();
+      JSRegExp::Flags flags = regexp->flags();
+
+      // Write /pattern/flags without GC.
+      AppendCharacter('/');
+      if (source->length() > 0) {
+        if (source->IsOneByteRepresentation()) {
+          if (IsExternalString(source)) {
+            auto result =
+                SerializeString<ExternalOneByteString>(source, no_gc);
+            if (result != SUCCESS) return result;
+          } else {
+            auto result = SerializeString<SeqOneByteString>(source, no_gc);
+            if (result != SUCCESS) return result;
+          }
+        } else {
+          if constexpr (is_one_byte) {
+            return SLOW_PATH;
+          } else {
+            if (IsExternalString(source)) {
+              auto result =
+                  SerializeString<ExternalTwoByteString>(source, no_gc);
+              if (result != SUCCESS) return result;
+            } else {
+              auto result = SerializeString<SeqTwoByteString>(source, no_gc);
+              if (result != SUCCESS) return result;
+            }
+          }
+        }
+      }
+      AppendCharacter('/');
+
+      // Write flags in canonical order.
+      if (flags & JSRegExp::kHasIndices) AppendCharacter('d');
+      if (flags & JSRegExp::kGlobal) AppendCharacter('g');
+      if (flags & JSRegExp::kIgnoreCase) AppendCharacter('i');
+      if (flags & JSRegExp::kMultiline) AppendCharacter('m');
+      if (flags & JSRegExp::kDotAll) AppendCharacter('s');
+      if (flags & JSRegExp::kUnicode) AppendCharacter('u');
+      if (flags & JSRegExp::kUnicodeSets) AppendCharacter('v');
+      if (flags & JSRegExp::kSticky) AppendCharacter('y');
+
+      return SUCCESS;
+    }
     default:
-      // BigInt, Map, Set, RegExp, TypedArray, TimeOnly, Duration, etc.
+      // Map, Set, TypedArray, TimeOnly, Duration, etc.
       return SLOW_PATH;
   }
   UNREACHABLE();

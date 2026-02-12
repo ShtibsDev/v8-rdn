@@ -35,6 +35,7 @@
 #include "src/objects/ordered-hash-table.h"
 #include "src/objects/string.h"
 #include "src/objects/descriptor-array-inl.h"
+#include "src/objects/field-index-inl.h"
 #include "src/objects/field-type.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/transitions.h"
@@ -183,6 +184,119 @@ static const constexpr uint8_t character_rdn_scan_flags[256] = {
 #define CALL_GET_SCAN_FLAGS(N) GetRdnScanFlags(128 + N),
         INT_0_TO_127_LIST(CALL_GET_SCAN_FLAGS)
 #undef CALL_GET_SCAN_FLAGS
+};
+
+// ── DateTime character validation lookup table (256-entry, constexpr) ──
+// Returns true for characters valid in a datetime token:
+// digits, '-', ':', '.', 'T', 'Z', '+'
+constexpr bool IsDateTimeChar(uint8_t c) {
+  return IsDecimalDigit(c) || c == '-' || c == ':' || c == '.' ||
+         c == 'T' || c == 'Z' || c == '+';
+}
+
+static constexpr bool kDateTimeCharValid[256] = {
+#define CALL_IS_DT(N) IsDateTimeChar(N),
+    INT_0_TO_127_LIST(CALL_IS_DT)
+#undef CALL_IS_DT
+#define CALL_IS_DT(N) IsDateTimeChar(128 + N),
+        INT_0_TO_127_LIST(CALL_IS_DT)
+#undef CALL_IS_DT
+};
+
+// Returns true for characters that terminate a datetime/duration token.
+constexpr bool IsDateTimeTerminator(uint8_t c) {
+  return c == ' ' || c == '\n' || c == '\r' || c == '\t' ||
+         c == ',' || c == '}' || c == ']' || c == ')';
+}
+
+static constexpr bool kDateTimeTerminator[256] = {
+#define CALL_IS_TERM(N) IsDateTimeTerminator(N),
+    INT_0_TO_127_LIST(CALL_IS_TERM)
+#undef CALL_IS_TERM
+#define CALL_IS_TERM(N) IsDateTimeTerminator(128 + N),
+        INT_0_TO_127_LIST(CALL_IS_TERM)
+#undef CALL_IS_TERM
+};
+
+// ── Duration character validation lookup table (256-entry, constexpr) ──
+constexpr bool IsDurationChar(uint8_t c) {
+  return IsDecimalDigit(c) || c == 'P' || c == 'Y' || c == 'M' ||
+         c == 'W' || c == 'D' || c == 'T' || c == 'H' || c == 'S' ||
+         c == '.';
+}
+
+static constexpr bool kDurationCharValid[256] = {
+#define CALL_IS_DUR(N) IsDurationChar(N),
+    INT_0_TO_127_LIST(CALL_IS_DUR)
+#undef CALL_IS_DUR
+#define CALL_IS_DUR(N) IsDurationChar(128 + N),
+        INT_0_TO_127_LIST(CALL_IS_DUR)
+#undef CALL_IS_DUR
+};
+
+// ── Hex value lookup table (256-entry, constexpr) ─────────────────
+// Returns the 4-bit value for hex digits, or 0xFF for invalid characters.
+// Used by ParseBinaryHex for direct-to-buffer decoding.
+constexpr uint8_t kHexInvalid = 0xFF;
+constexpr uint8_t GetHexValue(uint8_t c) {
+  return (c >= '0' && c <= '9') ? (c - '0')
+       : (c >= 'a' && c <= 'f') ? (c - 'a' + 10)
+       : (c >= 'A' && c <= 'F') ? (c - 'A' + 10)
+       : kHexInvalid;
+}
+
+static constexpr uint8_t kHexValueTable[256] = {
+#define CALL_GET_HEX(N) GetHexValue(N),
+    INT_0_TO_127_LIST(CALL_GET_HEX)
+#undef CALL_GET_HEX
+#define CALL_GET_HEX(N) GetHexValue(128 + N),
+        INT_0_TO_127_LIST(CALL_GET_HEX)
+#undef CALL_GET_HEX
+};
+
+// ── Base64 decode table (256-entry, constexpr, namespace scope) ───
+// Moved from ParseBinaryB64 function scope to avoid per-call stack allocation.
+constexpr int8_t GetB64Value(uint8_t c) {
+  return (c >= 'A' && c <= 'Z') ? (c - 'A')
+       : (c >= 'a' && c <= 'z') ? (c - 'a' + 26)
+       : (c >= '0' && c <= '9') ? (c - '0' + 52)
+       : (c == '+') ? 62
+       : (c == '/') ? 63
+       : -1;
+}
+
+static constexpr int8_t kB64DecodeTable[256] = {
+#define CALL_GET_B64(N) GetB64Value(N),
+    INT_0_TO_127_LIST(CALL_GET_B64)
+#undef CALL_GET_B64
+#define CALL_GET_B64(N) GetB64Value(128 + N),
+        INT_0_TO_127_LIST(CALL_GET_B64)
+#undef CALL_GET_B64
+};
+
+// ── Regex flag lookup table (256-entry, constexpr) ────────────────
+// Maps flag characters to their JSRegExp::Flags bit value.
+// Returns 0 for non-flag characters. Used by ParseRegex to replace
+// the 8-deep if/else chain.
+constexpr int GetRegexFlagBit(uint8_t c) {
+  return c == 'd' ? v8::RegExp::kHasIndices
+       : c == 'g' ? v8::RegExp::kGlobal
+       : c == 'i' ? v8::RegExp::kIgnoreCase
+       : c == 'm' ? v8::RegExp::kMultiline
+       : c == 's' ? v8::RegExp::kDotAll
+       : c == 'u' ? v8::RegExp::kUnicode
+       : c == 'v' ? v8::RegExp::kUnicodeSets
+       : c == 'y' ? v8::RegExp::kSticky
+       : 0;
+}
+
+static constexpr int kRegexFlagBits[256] = {
+#define CALL_GET_FLAG(N) GetRegexFlagBit(N),
+    INT_0_TO_127_LIST(CALL_GET_FLAG)
+#undef CALL_GET_FLAG
+#define CALL_GET_FLAG(N) GetRegexFlagBit(128 + N),
+        INT_0_TO_127_LIST(CALL_GET_FLAG)
+#undef CALL_GET_FLAG
 };
 
 template <typename Char>
@@ -775,8 +889,12 @@ RdnParser<Char>::RdnParser(Isolate* isolate, Handle<String> source)
 
   // Pre-allocate the GC-safe map cache before entering DisallowGC scope.
   object_map_cache_ = factory_->NewFixedArray(kObjectMapCacheSize);
+  type_map_cache_ = factory_->NewFixedArray(kTypeCacheSize);
   // Cache the Object constructor for fast empty {} creation.
   object_constructor_ = handle(isolate_->native_context()->object_function(), isolate_);
+  // Eagerly initialize TimeOnly/Duration key strings in the outermost
+  // HandleScope so they survive all nested HandleScope closes.
+  EnsureTimeKeysInitialized();
 
   if (StringShape(*source_).IsExternal()) {
     chars_ =
@@ -2772,6 +2890,47 @@ MaybeHandle<Object> RdnParser<Char>::ParseSetKeyword() {
 
 // ── @datetime / @timeonly / @duration / @unix ──────────────────────
 
+// ── Inline digit-pair extraction helpers for datetime parsing ──────
+// Parse a 2-digit number from raw Char* without bounds checks.
+template <typename Char>
+V8_INLINE int ReadDigitPair(const Char* p) {
+  return (p[0] - '0') * 10 + (p[1] - '0');
+}
+
+// Parse a 4-digit year from raw Char* without bounds checks.
+template <typename Char>
+V8_INLINE int ReadYear(const Char* p) {
+  return (p[0] - '0') * 1000 + (p[1] - '0') * 100 +
+         (p[2] - '0') * 10 + (p[3] - '0');
+}
+
+// Parse a 3-digit millisecond from raw Char* without bounds checks.
+template <typename Char>
+V8_INLINE int ReadMillis(const Char* p) {
+  return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
+// Compute epoch milliseconds from civil date/time using reverse Hinnant
+// algorithm. Avoids calling ParseDateTimeString entirely.
+V8_INLINE double CivilToEpochMs(int year, int month, int day,
+                                int hour, int min, int sec, int ms) {
+  // Civil date to days since epoch (Howard Hinnant's algorithm).
+  int y = year;
+  unsigned m = static_cast<unsigned>(month);
+  if (m <= 2) y--;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = static_cast<unsigned>(y - era * 400);
+  unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 +
+                 static_cast<unsigned>(day) - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int days = era * 146097 + static_cast<int>(doe) - 719468;
+  int64_t time_in_day_ms = static_cast<int64_t>(hour) * 3600000 +
+                           static_cast<int64_t>(min) * 60000 +
+                           static_cast<int64_t>(sec) * 1000 + ms;
+  return static_cast<double>(static_cast<int64_t>(days) * 86400000 +
+                             time_in_day_ms);
+}
+
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
   Advance();  // skip @
@@ -2783,61 +2942,46 @@ MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
   // Duration: @P...
   if (CurrentChar() == 'P') return ParseDuration();
 
-  // Read token until delimiter, validating characters
+  // ── Fused scan + classify + parse in a single pass ──────────────
+  // Instead of: scan → classify → allocate string → parse string,
+  // we scan the token, classify it inline, and for common formats
+  // parse fields directly from the raw Char* buffer.
   const Char* start = cursor_;
+  bool all_digits = true;
+  bool has_colon = false;
+  bool has_dash = false;
+  bool has_T = false;
+  bool has_plus = false;
+  bool leading_minus = false;
+  int digit_count = 0;
+
   while (cursor_ < end_) {
     Char ch = *cursor_;
-    if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' ||
-        ch == ',' || ch == '}' || ch == ']' || ch == ')') break;
-    if (!IsDecimalDigit(ch) && ch != '-' && ch != ':' && ch != '.' &&
-        ch != 'T' && ch != 'Z' && ch != '+') {
+    // Use lookup tables for O(1) terminator/validity checks instead
+    // of multi-condition chains.
+    if (ch <= 0xFF && kDateTimeTerminator[static_cast<uint8_t>(ch)]) break;
+    if (ch > 0xFF || !kDateTimeCharValid[static_cast<uint8_t>(ch)]) {
       ReportError("Invalid character in datetime");
       return MaybeHandle<Object>();
+    }
+    if (ch >= '0' && ch <= '9') {
+      digit_count++;
+    } else if (ch == '-') {
+      if (cursor_ == start) leading_minus = true;
+      else { has_dash = true; all_digits = false; }
+    } else if (ch == ':') {
+      has_colon = true; all_digits = false;
+    } else if (ch == 'T') {
+      has_T = true; all_digits = false;
+    } else if (ch == '+') {
+      has_plus = true; all_digits = false;
+    } else {
+      all_digits = false;
     }
     cursor_++;
   }
 
   int token_len = static_cast<int>(cursor_ - start);
-
-  // Classify the token
-  bool all_digits = true;
-  bool has_colon = false;
-  bool has_dash = false;
-  bool has_T = false;
-  bool leading_minus = false;
-  int digit_count = 0;
-
-  for (const Char* p = start; p < cursor_; p++) {
-    Char ch = *p;
-    if (ch >= '0' && ch <= '9') {
-      digit_count++;
-    } else if (ch == '-') {
-      if (p == start) leading_minus = true;
-      else { has_dash = true; all_digits = false; }
-    } else if (ch == ':') {
-      has_colon = true;
-      all_digits = false;
-    } else if (ch == 'T') {
-      has_T = true;
-      all_digits = false;
-    } else {
-      all_digits = false;
-    }
-  }
-
-  // Build token string
-  Handle<String> token;
-  if (sizeof(Char) == 1) {
-    token = factory_->NewStringFromOneByte(
-        base::Vector<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(start), token_len))
-        .ToHandleChecked();
-  } else {
-    token = factory_->NewStringFromTwoByte(
-        base::Vector<const base::uc16>(
-            reinterpret_cast<const base::uc16*>(start), token_len))
-        .ToHandleChecked();
-  }
 
   // Unix timestamp: all digits (optionally leading minus)
   if (all_digits && digit_count == token_len - (leading_minus ? 1 : 0)) {
@@ -2858,12 +3002,11 @@ MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
   if (has_colon && !has_dash && !has_T) {
     const Char* p = start;
 
-    // Parse hours: exactly 2 digits
     if (cursor_ - p < 2 || !IsDecimalDigit(p[0]) || !IsDecimalDigit(p[1])) {
       ReportError("Time requires 2-digit hours (HH)");
       return MaybeHandle<Object>();
     }
-    int h = (p[0] - '0') * 10 + (p[1] - '0');
+    int h = ReadDigitPair(p);
     p += 2;
 
     if (p >= cursor_ || *p != ':') {
@@ -2872,23 +3015,21 @@ MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
     }
     p++;
 
-    // Parse minutes: exactly 2 digits
     if (cursor_ - p < 2 || !IsDecimalDigit(p[0]) || !IsDecimalDigit(p[1])) {
       ReportError("Time requires 2-digit minutes (MM)");
       return MaybeHandle<Object>();
     }
-    int m = (p[0] - '0') * 10 + (p[1] - '0');
+    int m = ReadDigitPair(p);
     p += 2;
 
     int s = 0, ms = 0;
     if (p < cursor_ && *p == ':') {
       p++;
-      // Parse seconds: exactly 2 digits
       if (cursor_ - p < 2 || !IsDecimalDigit(p[0]) || !IsDecimalDigit(p[1])) {
         ReportError("Time requires 2-digit seconds (SS)");
         return MaybeHandle<Object>();
       }
-      s = (p[0] - '0') * 10 + (p[1] - '0');
+      s = ReadDigitPair(p);
       p += 2;
 
       if (p < cursor_ && *p == '.') {
@@ -2920,21 +3061,99 @@ MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
     return MakeTimeOnly(h, m, s, ms);
   }
 
-  // Date only: YYYY-MM-DD (exactly 10 chars)
-  if (token_len == 10 && has_dash && !has_T && !has_colon) {
-    Handle<String> suffix = factory_->NewStringFromAsciiChecked("T00:00:00Z");
-    Handle<String> iso_str =
-        factory_->NewConsString(token, suffix).ToHandleChecked();
-    iso_str = String::Flatten(isolate_, iso_str);
-    double time_val = ParseDateTimeString(isolate_, iso_str);
-    if (std::isnan(time_val)) {
-      ReportError("Invalid date");
-      return MaybeHandle<Object>();
+  // ── Inline fast path: full ISO datetime ─────────────────────────
+  // Handles the two most common formats directly from raw Char*:
+  // - YYYY-MM-DDTHH:MM:SS.mmmZ  (24 chars) — full datetime with millis
+  // - YYYY-MM-DDTHH:MM:SSZ      (20 chars) — full datetime without millis
+  // - YYYY-MM-DD                 (10 chars) — date only (midnight UTC)
+  // Computes epoch ms via reverse Hinnant algorithm — no string allocation,
+  // no ParseDateTimeString call. Falls back for rare formats (tz offsets).
+  if (has_T && has_dash && !has_plus) {
+    // Validate structural positions for YYYY-MM-DDTHH:MM:SS[.mmm]Z
+    if (token_len >= 20 && start[4] == '-' && start[7] == '-' &&
+        start[10] == 'T' && start[13] == ':' && start[16] == ':') {
+      // Validate all digit positions
+      bool digits_ok = true;
+      // YYYY
+      for (int i = 0; i < 4; i++) digits_ok &= IsDecimalDigit(start[i]);
+      // MM
+      digits_ok &= IsDecimalDigit(start[5]) && IsDecimalDigit(start[6]);
+      // DD
+      digits_ok &= IsDecimalDigit(start[8]) && IsDecimalDigit(start[9]);
+      // HH
+      digits_ok &= IsDecimalDigit(start[11]) && IsDecimalDigit(start[12]);
+      // MM
+      digits_ok &= IsDecimalDigit(start[14]) && IsDecimalDigit(start[15]);
+      // SS
+      digits_ok &= IsDecimalDigit(start[17]) && IsDecimalDigit(start[18]);
+
+      if (digits_ok) {
+        int year = ReadYear(start);
+        int month = ReadDigitPair(start + 5);
+        int day = ReadDigitPair(start + 8);
+        int hour = ReadDigitPair(start + 11);
+        int min = ReadDigitPair(start + 14);
+        int sec = ReadDigitPair(start + 17);
+        int ms = 0;
+
+        bool valid_format = false;
+        if (token_len == 24 && start[19] == '.' && start[23] == 'Z') {
+          // YYYY-MM-DDTHH:MM:SS.mmmZ
+          if (IsDecimalDigit(start[20]) && IsDecimalDigit(start[21]) &&
+              IsDecimalDigit(start[22])) {
+            ms = ReadMillis(start + 20);
+            valid_format = true;
+          }
+        } else if (token_len == 20 && start[19] == 'Z') {
+          // YYYY-MM-DDTHH:MM:SSZ
+          valid_format = true;
+        }
+
+        if (valid_format && month >= 1 && month <= 12 && day >= 1 &&
+            day <= 31 && hour <= 23 && min <= 59 && sec <= 59) {
+          double epoch_ms = CivilToEpochMs(year, month, day, hour, min,
+                                           sec, ms);
+          return MakeDate(epoch_ms);
+        }
+      }
     }
-    return MakeDate(time_val);
   }
 
-  // Full ISO datetime
+  // Date only: YYYY-MM-DD (exactly 10 chars) — inline fast path
+  if (token_len == 10 && has_dash && !has_T && !has_colon) {
+    bool digits_ok = true;
+    for (int i = 0; i < 4; i++) digits_ok &= IsDecimalDigit(start[i]);
+    digits_ok &= start[4] == '-';
+    digits_ok &= IsDecimalDigit(start[5]) && IsDecimalDigit(start[6]);
+    digits_ok &= start[7] == '-';
+    digits_ok &= IsDecimalDigit(start[8]) && IsDecimalDigit(start[9]);
+    if (digits_ok) {
+      int year = ReadYear(start);
+      int month = ReadDigitPair(start + 5);
+      int day = ReadDigitPair(start + 8);
+      if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        double epoch_ms = CivilToEpochMs(year, month, day, 0, 0, 0, 0);
+        return MakeDate(epoch_ms);
+      }
+    }
+    // Fall through to slow path on validation failure.
+  }
+
+  // ── Slow path: allocate string, call ParseDateTimeString ────────
+  // For rare formats: timezone offsets (+05:30), negative years, etc.
+  Handle<String> token;
+  if (sizeof(Char) == 1) {
+    token = factory_->NewStringFromOneByte(
+        base::Vector<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(start), token_len))
+        .ToHandleChecked();
+  } else {
+    token = factory_->NewStringFromTwoByte(
+        base::Vector<const base::uc16>(
+            reinterpret_cast<const base::uc16*>(start), token_len))
+        .ToHandleChecked();
+  }
+
   double time_val = ParseDateTimeString(isolate_, token);
   if (std::isnan(time_val)) {
     ReportError("Invalid date");
@@ -2948,12 +3167,9 @@ MaybeHandle<Object> RdnParser<Char>::ParseDuration() {
   const Char* start = cursor_;
   while (cursor_ < end_) {
     Char ch = *cursor_;
-    if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' ||
-        ch == ',' || ch == '}' || ch == ']' || ch == ')') break;
-    // Validate: only duration-valid characters
-    if (!IsDecimalDigit(ch) && ch != 'P' && ch != 'Y' && ch != 'M' &&
-        ch != 'W' && ch != 'D' && ch != 'T' && ch != 'H' && ch != 'S' &&
-        ch != '.') {
+    // Use lookup tables for O(1) terminator/validity checks.
+    if (ch <= 0xFF && kDateTimeTerminator[static_cast<uint8_t>(ch)]) break;
+    if (ch > 0xFF || !kDurationCharValid[static_cast<uint8_t>(ch)]) {
       ReportError("Invalid character in duration");
       return MaybeHandle<Object>();
     }
@@ -3002,87 +3218,120 @@ MaybeHandle<Object> RdnParser<Char>::ParseDuration() {
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseRegex() {
   Advance();  // skip opening /
-  std::vector<base::uc16> pattern_chars;
+
+  // ── Phase 1: Scan without collecting ─────────────────────────────
+  // Record (start, end, has_escape) like ScanRdnString — no heap allocation.
+  const Char* pattern_start = cursor_;
+  bool has_escape = false;
   bool escaped = false;
 
   while (cursor_ < end_) {
     Char c = *cursor_;
     if (escaped) {
-      pattern_chars.push_back(static_cast<base::uc16>(c));
       escaped = false;
       cursor_++;
       continue;
     }
     if (c == '\\') {
-      pattern_chars.push_back('\\');
+      has_escape = true;
       escaped = true;
       cursor_++;
       continue;
     }
-    if (c == '/') {
-      cursor_++;
-      v8::RegExp::Flags flags = v8::RegExp::kNone;
-      while (cursor_ < end_) {
-        Char fc = *cursor_;
-        if (fc == 'g') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kGlobal); }
-        else if (fc == 'i') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kIgnoreCase); }
-        else if (fc == 'm') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kMultiline); }
-        else if (fc == 's') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kDotAll); }
-        else if (fc == 'u') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kUnicode); }
-        else if (fc == 'y') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kSticky); }
-        else if (fc == 'd') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kHasIndices); }
-        else if (fc == 'v') { flags = static_cast<v8::RegExp::Flags>(flags | v8::RegExp::kUnicodeSets); }
-        else {
-          if ((fc >= 'a' && fc <= 'z') || (fc >= 'A' && fc <= 'Z')) {
-            ReportError("Unknown regex flag");
-            return MaybeHandle<Object>();
-          }
-          break;
-        }
-        cursor_++;
-      }
-
-      Handle<String> pattern_str;
-      if (pattern_chars.empty()) {
-        pattern_str = factory_->empty_string();
-      } else {
-        bool is_one_byte = true;
-        for (base::uc16 ch : pattern_chars) {
-          if (ch > 0xFF) { is_one_byte = false; break; }
-        }
-        if (is_one_byte) {
-          std::vector<uint8_t> one_byte(pattern_chars.size());
-          for (size_t i = 0; i < pattern_chars.size(); i++) {
-            one_byte[i] = static_cast<uint8_t>(pattern_chars[i]);
-          }
-          pattern_str = factory_->NewStringFromOneByte(
-              base::Vector<const uint8_t>(one_byte.data(),
-                                          static_cast<int>(one_byte.size())))
-              .ToHandleChecked();
-        } else {
-          pattern_str = factory_->NewStringFromTwoByte(
-              base::Vector<const base::uc16>(
-                  pattern_chars.data(),
-                  static_cast<int>(pattern_chars.size())))
-              .ToHandleChecked();
-        }
-      }
-
-      JSRegExp::Flags internal_flags = static_cast<JSRegExp::Flags>(flags);
-      MaybeDirectHandle<JSRegExp> result =
-          JSRegExp::New(isolate_, pattern_str, internal_flags);
-      if (result.is_null()) {
-        ReportError("Invalid regex");
-        return MaybeHandle<Object>();
-      }
-      return handle(*result.ToHandleChecked(), isolate_);
-    }
-    pattern_chars.push_back(static_cast<base::uc16>(c));
+    if (c == '/') break;
     cursor_++;
   }
 
-  ReportError("Unterminated regex");
-  return MaybeHandle<Object>();
+  if (cursor_ >= end_) {
+    ReportError("Unterminated regex");
+    return MaybeHandle<Object>();
+  }
+
+  const Char* pattern_end = cursor_;
+  int pattern_len = static_cast<int>(pattern_end - pattern_start);
+  cursor_++;  // skip closing /
+
+  // ── Phase 2: Parse flags via lookup table ─────────────────────────
+  v8::RegExp::Flags flags = v8::RegExp::kNone;
+  while (cursor_ < end_) {
+    Char fc = *cursor_;
+    if (fc > 127) break;
+    int bit = kRegexFlagBits[static_cast<uint8_t>(fc)];
+    if (bit == 0) {
+      if ((fc >= 'a' && fc <= 'z') || (fc >= 'A' && fc <= 'Z')) {
+        ReportError("Unknown regex flag");
+        return MaybeHandle<Object>();
+      }
+      break;
+    }
+    flags = static_cast<v8::RegExp::Flags>(flags | bit);
+    cursor_++;
+  }
+
+  // ── Phase 3: Materialize pattern string ──────────────────────────
+  Handle<String> pattern_str;
+  if (pattern_len == 0) {
+    pattern_str = factory_->empty_string();
+  } else if (!has_escape) {
+    // No-escape fast path: create string directly from source buffer slice.
+    if (sizeof(Char) == 1) {
+      pattern_str = factory_->NewStringFromOneByte(
+          base::Vector<const uint8_t>(
+              reinterpret_cast<const uint8_t*>(pattern_start), pattern_len))
+          .ToHandleChecked();
+    } else {
+      pattern_str = factory_->NewStringFromTwoByte(
+          base::Vector<const base::uc16>(
+              reinterpret_cast<const base::uc16*>(pattern_start), pattern_len))
+          .ToHandleChecked();
+    }
+  } else {
+    // Escape path: collect chars using stack-allocated SmallVector.
+    base::SmallVector<base::uc16, 128> chars;
+    escaped = false;
+    for (const Char* p = pattern_start; p < pattern_end; p++) {
+      Char c = *p;
+      if (escaped) {
+        chars.push_back(static_cast<base::uc16>(c));
+        escaped = false;
+        continue;
+      }
+      if (c == '\\') {
+        chars.push_back('\\');
+        escaped = true;
+        continue;
+      }
+      chars.push_back(static_cast<base::uc16>(c));
+    }
+    bool is_one_byte = true;
+    for (base::uc16 ch : chars) {
+      if (ch > 0xFF) { is_one_byte = false; break; }
+    }
+    if (is_one_byte) {
+      base::SmallVector<uint8_t, 128> one_byte(chars.size());
+      for (size_t i = 0; i < chars.size(); i++) {
+        one_byte[i] = static_cast<uint8_t>(chars[i]);
+      }
+      pattern_str = factory_->NewStringFromOneByte(
+          base::Vector<const uint8_t>(one_byte.data(),
+                                      static_cast<int>(one_byte.size())))
+          .ToHandleChecked();
+    } else {
+      pattern_str = factory_->NewStringFromTwoByte(
+          base::Vector<const base::uc16>(
+              chars.data(), static_cast<int>(chars.size())))
+          .ToHandleChecked();
+    }
+  }
+
+  JSRegExp::Flags internal_flags = static_cast<JSRegExp::Flags>(flags);
+  MaybeDirectHandle<JSRegExp> result =
+      JSRegExp::New(isolate_, pattern_str, internal_flags);
+  if (result.is_null()) {
+    ReportError("Invalid regex");
+    return MaybeHandle<Object>();
+  }
+  return handle(*result.ToHandleChecked(), isolate_);
 }
 
 // ── Binary base64: b"..." ─────────────────────────────────────────
@@ -3093,69 +3342,67 @@ MaybeHandle<Object> RdnParser<Char>::ParseBinaryB64() {
     ReportError("Expected 'b\"'");
     return MaybeHandle<Object>();
   }
-  Advance();  // skip b
-  Handle<Object> encoded_obj;
-  ASSIGN_RETURN_ON_EXCEPTION(isolate_, encoded_obj, ParseString());
-  Handle<String> encoded = Cast<String>(encoded_obj);
+  Advance(2);  // skip b"
 
-  int str_len = encoded->length();
-  int decoded_len = (str_len * 3) / 4;
-  std::vector<uint8_t> decoded(decoded_len + 4);
-
-  static const int8_t b64_table[256] = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-  };
-
-  encoded = String::Flatten(isolate_, encoded);
-  DisallowGarbageCollection no_gc;
-  int out_pos = 0;
-  uint32_t accum = 0;
-  int bits = 0;
-
-  for (int i = 0; i < str_len; i++) {
-    uint16_t ch = encoded->Get(i);
-    if (ch == '=') continue;
-    if (ch > 255 || b64_table[ch] < 0) {
-      AllowGarbageCollection allow_gc2;
-      ReportError("Invalid base64 character");
-      return MaybeHandle<Object>();
-    }
-    int8_t val = b64_table[ch];
-    accum = (accum << 6) | val;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      decoded[out_pos++] = static_cast<uint8_t>((accum >> bits) & 0xFF);
-    }
+  // ── Direct-to-buffer base64 decoding ──────────────────────────────
+  // Scan for closing '"' directly from cursor — base64 content has no
+  // escape sequences, so we can skip ParseString entirely. Uses the
+  // constexpr kB64DecodeTable at namespace scope (no per-call stack alloc).
+  // Allocates JSArrayBuffer first, decodes directly into backing store.
+  const Char* b64_start = cursor_;
+  while (cursor_ < end_ && *cursor_ != '"') {
+    cursor_++;
+  }
+  if (cursor_ >= end_) {
+    ReportError("Unterminated base64 string");
+    return MaybeHandle<Object>();
   }
 
-  int actual_len = out_pos;
-  AllowGarbageCollection allow_gc;
+  int str_len = static_cast<int>(cursor_ - b64_start);
+  Advance();  // skip closing "
 
+  // Count padding to compute exact decoded length.
+  int padding = 0;
+  if (str_len >= 1 && b64_start[str_len - 1] == '=') padding++;
+  if (str_len >= 2 && b64_start[str_len - 2] == '=') padding++;
+  int decoded_len = (str_len * 3) / 4 - padding;
+  if (decoded_len < 0) decoded_len = 0;
+
+  // Allocate backing store first, then decode directly into it.
   Handle<JSArrayBuffer> buffer;
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate_, buffer,
       factory_->NewJSArrayBufferAndBackingStore(
-          actual_len, InitializedFlag::kUninitialized));
-  if (actual_len > 0) {
-    memcpy(buffer->backing_store(), decoded.data(), actual_len);
+          decoded_len, InitializedFlag::kUninitialized));
+
+  if (decoded_len > 0) {
+    uint8_t* out = static_cast<uint8_t*>(buffer->backing_store());
+    int out_pos = 0;
+    uint32_t accum = 0;
+    int bits = 0;
+
+    for (int i = 0; i < str_len; i++) {
+      Char ch = b64_start[i];
+      if (ch == '=') continue;
+      if (ch > 255) {
+        ReportError("Invalid base64 character");
+        return MaybeHandle<Object>();
+      }
+      int8_t val = kB64DecodeTable[static_cast<uint8_t>(ch)];
+      if (val < 0) {
+        ReportError("Invalid base64 character");
+        return MaybeHandle<Object>();
+      }
+      accum = (accum << 6) | static_cast<uint32_t>(val);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[out_pos++] = static_cast<uint8_t>((accum >> bits) & 0xFF);
+      }
+    }
   }
-  return factory_->NewJSTypedArray(kExternalUint8Array, buffer, 0, actual_len);
+
+  return factory_->NewJSTypedArray(kExternalUint8Array, buffer, 0, decoded_len);
 }
 
 // ── Binary hex: x"..." ────────────────────────────────────────────
@@ -3166,53 +3413,54 @@ MaybeHandle<Object> RdnParser<Char>::ParseBinaryHex() {
     ReportError("Expected 'x\"'");
     return MaybeHandle<Object>();
   }
-  Advance();  // skip x
-  Handle<Object> encoded_obj;
-  ASSIGN_RETURN_ON_EXCEPTION(isolate_, encoded_obj, ParseString());
-  Handle<String> encoded = Cast<String>(encoded_obj);
+  Advance(2);  // skip x"
 
-  int str_len = encoded->length();
+  // ── Direct-to-buffer hex decoding ─────────────────────────────────
+  // Scan for closing '"' directly from cursor — hex content [0-9a-fA-F]
+  // has no escape sequences, so we can skip ParseString entirely.
+  // Decode using the constexpr kHexValueTable lookup, writing directly
+  // into the JSArrayBuffer backing store.
+  const Char* hex_start = cursor_;
+  while (cursor_ < end_ && *cursor_ != '"') {
+    cursor_++;
+  }
+  if (cursor_ >= end_) {
+    ReportError("Unterminated hex string");
+    return MaybeHandle<Object>();
+  }
+
+  int str_len = static_cast<int>(cursor_ - hex_start);
+  Advance();  // skip closing "
+
   if (str_len % 2 != 0) {
     ReportError("Hex string must have even length");
     return MaybeHandle<Object>();
   }
   int byte_len = str_len / 2;
 
-  std::vector<uint8_t> decoded(byte_len);
-  encoded = String::Flatten(isolate_, encoded);
-  DisallowGarbageCollection no_gc;
-
-  auto is_hex_digit = [](uint16_t c) -> bool {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-  };
-  auto hex_val = [](uint16_t c) -> int {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 0;
-  };
-
-  for (int i = 0; i < byte_len; i++) {
-    uint16_t hi = encoded->Get(i * 2);
-    uint16_t lo = encoded->Get(i * 2 + 1);
-    if (!is_hex_digit(hi) || !is_hex_digit(lo)) {
-      AllowGarbageCollection allow_gc2;
-      ReportError("Invalid hex character");
-      return MaybeHandle<Object>();
-    }
-    decoded[i] = static_cast<uint8_t>((hex_val(hi) << 4) | hex_val(lo));
-  }
-
-  AllowGarbageCollection allow_gc;
-
+  // Allocate backing store first, then decode directly into it.
   Handle<JSArrayBuffer> buffer;
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate_, buffer,
       factory_->NewJSArrayBufferAndBackingStore(
           byte_len, InitializedFlag::kUninitialized));
+
   if (byte_len > 0) {
-    memcpy(buffer->backing_store(), decoded.data(), byte_len);
+    uint8_t* out = static_cast<uint8_t*>(buffer->backing_store());
+    const Char* p = hex_start;
+    for (int i = 0; i < byte_len; i++) {
+      uint8_t hi_char = static_cast<uint8_t>(p[i * 2]);
+      uint8_t lo_char = static_cast<uint8_t>(p[i * 2 + 1]);
+      uint8_t hi = kHexValueTable[hi_char];
+      uint8_t lo = kHexValueTable[lo_char];
+      if (hi == kHexInvalid || lo == kHexInvalid) {
+        ReportError("Invalid hex character");
+        return MaybeHandle<Object>();
+      }
+      out[i] = (hi << 4) | lo;
+    }
   }
+
   return factory_->NewJSTypedArray(kExternalUint8Array, buffer, 0, byte_len);
 }
 
@@ -3235,25 +3483,46 @@ MaybeHandle<Object> RdnParser<Char>::MakeDate(double time_ms) {
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::MakeTimeOnly(int h, int m, int s,
                                                    int ms) {
+  EnsureTimeKeysInitialized();
+
+  // Fast path: reuse the cached map from a previous MakeTimeOnly call.
+  // Maps stored in GC-traced FixedArray to survive nested HandleScope closes.
+  Tagged<Object> cached = type_map_cache_->get(kTypeCacheTimeOnly);
+  if (IsMap(cached)) {
+    Handle<Map> map(Cast<Map>(cached), isolate_);
+    Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
+    obj->RawFastInobjectPropertyAtPut(time_only_fi_[0], Smi::FromInt(h),
+                                      SKIP_WRITE_BARRIER);
+    obj->RawFastInobjectPropertyAtPut(time_only_fi_[1], Smi::FromInt(m),
+                                      SKIP_WRITE_BARRIER);
+    obj->RawFastInobjectPropertyAtPut(time_only_fi_[2], Smi::FromInt(s),
+                                      SKIP_WRITE_BARRIER);
+    obj->RawFastInobjectPropertyAtPut(time_only_fi_[3], Smi::FromInt(ms),
+                                      SKIP_WRITE_BARRIER);
+    obj->RawFastInobjectPropertyAtPut(time_only_fi_[4],
+                                      *cached_time_only_str_);
+    return obj;
+  }
+
+  // Slow path (first call): build via AddProperty, then cache map + field indices.
   Handle<JSObject> obj = factory_->NewJSObject(isolate_->object_function());
-  Handle<String> hours_key = factory_->NewStringFromAsciiChecked("hours");
-  Handle<String> minutes_key = factory_->NewStringFromAsciiChecked("minutes");
-  Handle<String> seconds_key = factory_->NewStringFromAsciiChecked("seconds");
-  Handle<String> ms_key = factory_->NewStringFromAsciiChecked("milliseconds");
-
-  JSObject::AddProperty(isolate_, obj, hours_key,
+  JSObject::AddProperty(isolate_, obj, cached_hours_key_,
                         handle(Smi::FromInt(h), isolate_), NONE);
-  JSObject::AddProperty(isolate_, obj, minutes_key,
+  JSObject::AddProperty(isolate_, obj, cached_minutes_key_,
                         handle(Smi::FromInt(m), isolate_), NONE);
-  JSObject::AddProperty(isolate_, obj, seconds_key,
+  JSObject::AddProperty(isolate_, obj, cached_seconds_key_,
                         handle(Smi::FromInt(s), isolate_), NONE);
-  JSObject::AddProperty(isolate_, obj, ms_key,
+  JSObject::AddProperty(isolate_, obj, cached_ms_key_,
                         handle(Smi::FromInt(ms), isolate_), NONE);
+  JSObject::AddProperty(isolate_, obj, cached_type_key_,
+                        cached_time_only_str_, DONT_ENUM);
 
-  Handle<String> type_key = factory_->NewStringFromAsciiChecked("__type__");
-  Handle<String> type_val = factory_->NewStringFromAsciiChecked("TimeOnly");
-  JSObject::AddProperty(isolate_, obj, type_key, type_val, DONT_ENUM);
-
+  // Cache the final map in the GC-traced FixedArray + FieldIndex per descriptor.
+  Tagged<Map> final_map = obj->map();
+  type_map_cache_->set(kTypeCacheTimeOnly, final_map);
+  for (int i = 0; i < 5; i++) {
+    time_only_fi_[i] = FieldIndex::ForDescriptor(final_map, InternalIndex(i));
+  }
   return obj;
 }
 
@@ -3261,14 +3530,32 @@ MaybeHandle<Object> RdnParser<Char>::MakeTimeOnly(int h, int m, int s,
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::MakeDuration(Handle<String> iso) {
+  EnsureTimeKeysInitialized();
+
+  // Fast path: reuse the cached map from a previous MakeDuration call.
+  // Maps stored in GC-traced FixedArray to survive nested HandleScope closes.
+  Tagged<Object> cached = type_map_cache_->get(kTypeCacheDuration);
+  if (IsMap(cached)) {
+    Handle<Map> map(Cast<Map>(cached), isolate_);
+    Handle<JSObject> obj = factory_->NewJSObjectFromMap(map);
+    obj->RawFastInobjectPropertyAtPut(duration_fi_[0], *iso);
+    obj->RawFastInobjectPropertyAtPut(duration_fi_[1],
+                                      *cached_duration_str_);
+    return obj;
+  }
+
+  // Slow path (first call): build via AddProperty, then cache map + field indices.
   Handle<JSObject> obj = factory_->NewJSObject(isolate_->object_function());
-  Handle<String> iso_key = factory_->NewStringFromAsciiChecked("iso");
-  JSObject::AddProperty(isolate_, obj, iso_key, iso, NONE);
+  JSObject::AddProperty(isolate_, obj, cached_iso_key_, iso, NONE);
+  JSObject::AddProperty(isolate_, obj, cached_type_key_,
+                        cached_duration_str_, DONT_ENUM);
 
-  Handle<String> type_key = factory_->NewStringFromAsciiChecked("__type__");
-  Handle<String> type_val = factory_->NewStringFromAsciiChecked("Duration");
-  JSObject::AddProperty(isolate_, obj, type_key, type_val, DONT_ENUM);
-
+  // Cache the final map in the GC-traced FixedArray + FieldIndex per descriptor.
+  Tagged<Map> final_map = obj->map();
+  type_map_cache_->set(kTypeCacheDuration, final_map);
+  for (int i = 0; i < 2; i++) {
+    duration_fi_[i] = FieldIndex::ForDescriptor(final_map, InternalIndex(i));
+  }
   return obj;
 }
 
