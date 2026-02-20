@@ -1734,3 +1734,74 @@ assertThrows(() => RDN.parse('{"key":'), SyntaxError);
 // RDN.parse.length and RDN.stringify.length should be 2
 assertEquals(2, RDN.parse.length);
 assertEquals(2, RDN.stringify.length);
+
+// ── Stack overflow protection ───────────────────────────────────────
+
+{
+  // Deeply nested arrays.
+  const deep_array = "[".repeat(100000) + "]".repeat(100000);
+  assertThrows(() => RDN.parse(deep_array), RangeError);
+
+  // Deeply nested objects.
+  const deep_obj =
+      '{"a":'.repeat(50000) + '1' + '}'.repeat(50000);
+  assertThrows(() => RDN.parse(deep_obj), RangeError);
+
+  // Deeply nested tuples.
+  const deep_tuple = "(".repeat(100000) + ")".repeat(100000);
+  assertThrows(() => RDN.parse(deep_tuple), RangeError);
+}
+
+// ── Array-index key handling ────────────────────────────────────────
+
+{
+  // Basic numeric keys should produce indexed elements like JSON.parse.
+  const rdn_result = RDN.parse('{"0": "a", "1": "b", "name": "x"}');
+  const json_result = JSON.parse('{"0": "a", "1": "b", "name": "x"}');
+  assertEquals(json_result[0], rdn_result[0]);
+  assertEquals(json_result[1], rdn_result[1]);
+  assertEquals(json_result.name, rdn_result.name);
+  assertEquals(Object.keys(json_result).length,
+               Object.keys(rdn_result).length);
+
+  // Pure numeric keys.
+  const rdn_pure = RDN.parse('{"0": "a", "1": "b", "2": "c"}');
+  const json_pure = JSON.parse('{"0": "a", "1": "b", "2": "c"}');
+  assertEquals(json_pure[0], rdn_pure[0]);
+  assertEquals(json_pure[1], rdn_pure[1]);
+  assertEquals(json_pure[2], rdn_pure[2]);
+
+  // Key "0" alone.
+  const rdn_zero = RDN.parse('{"0": "val"}');
+  assertEquals("val", rdn_zero[0]);
+  assertEquals("val", rdn_zero["0"]);
+
+  // Sparse numeric keys (should use dictionary elements).
+  const rdn_sparse = RDN.parse('{"0": "a", "1000000": "b"}');
+  assertEquals("a", rdn_sparse[0]);
+  assertEquals("b", rdn_sparse[1000000]);
+
+  // Non-index numeric-looking keys: leading zeros → named, not index.
+  const rdn_leading = RDN.parse('{"00": "a", "01": "b"}');
+  assertEquals("a", rdn_leading["00"]);
+  assertEquals("b", rdn_leading["01"]);
+  assertEquals(undefined, rdn_leading[0]);
+
+  // Mixed numeric and named keys — verify enumeration order matches JSON.parse.
+  const mixed_rdn = RDN.parse(
+      '{"z": 1, "0": "a", "y": 2, "1": "b", "x": 3}');
+  const mixed_json = JSON.parse(
+      '{"z": 1, "0": "a", "y": 2, "1": "b", "x": 3}');
+  assertEquals(JSON.stringify(Object.keys(mixed_json)),
+               JSON.stringify(Object.keys(mixed_rdn)));
+  assertEquals(mixed_json[0], mixed_rdn[0]);
+  assertEquals(mixed_json[1], mixed_rdn[1]);
+  assertEquals(mixed_json.z, mixed_rdn.z);
+
+  // Array of objects with index keys — test within array element feedback path.
+  const arr = RDN.parse('[{"0": "a", "name": "x"}, {"0": "b", "name": "y"}]');
+  assertEquals("a", arr[0][0]);
+  assertEquals("b", arr[1][0]);
+  assertEquals("x", arr[0].name);
+  assertEquals("y", arr[1].name);
+}

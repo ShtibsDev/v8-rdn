@@ -5,6 +5,8 @@
 #ifndef V8_JSON_RDN_PARSER_H_
 #define V8_JSON_RDN_PARSER_H_
 
+#include <algorithm>
+
 #include "src/base/small-vector.h"
 #include "src/base/strings.h"
 #include "src/execution/isolate.h"
@@ -28,7 +30,16 @@ class RdnString final {
         length_(0),
         needs_conversion_(false),
         internalize_(false),
-        has_escape_(false) {}
+        has_escape_(false),
+        is_index_(false) {}
+
+  explicit RdnString(uint32_t index)
+      : index_(index),
+        length_(0),
+        needs_conversion_(false),
+        internalize_(false),
+        has_escape_(false),
+        is_index_(true) {}
 
   RdnString(uint32_t start, uint32_t length, bool needs_conversion,
             bool internalize, bool has_escape)
@@ -36,20 +47,45 @@ class RdnString final {
         length_(length),
         needs_conversion_(needs_conversion),
         internalize_(internalize),
-        has_escape_(has_escape) {}
+        has_escape_(has_escape),
+        is_index_(false) {}
 
-  bool internalize() const { return internalize_; }
-  bool needs_conversion() const { return needs_conversion_; }
-  bool has_escape() const { return has_escape_; }
-  uint32_t start() const { return start_; }
-  uint32_t length() const { return length_; }
+  bool internalize() const {
+    DCHECK(!is_index_);
+    return internalize_;
+  }
+  bool needs_conversion() const {
+    DCHECK(!is_index_);
+    return needs_conversion_;
+  }
+  bool has_escape() const {
+    DCHECK(!is_index_);
+    return has_escape_;
+  }
+  uint32_t start() const {
+    DCHECK(!is_index_);
+    return start_;
+  }
+  uint32_t length() const {
+    DCHECK(!is_index_);
+    return length_;
+  }
+  uint32_t index() const {
+    DCHECK(is_index_);
+    return index_;
+  }
+  bool is_index() const { return is_index_; }
 
  private:
-  uint32_t start_;
+  union {
+    uint32_t start_;
+    uint32_t index_;
+  };
   uint32_t length_;
   bool needs_conversion_ : 1;
   bool internalize_ : 1;
   bool has_escape_ : 1;
+  bool is_index_ : 1;
 };
 
 // Property descriptor for deferred object construction via RdnDataObjectBuilder.
@@ -112,6 +148,7 @@ class RdnParser final {
   // string path). Uses property_stack_ + RdnDataObjectBuilder for optimal
   // object construction with deferred string materialization.
   MaybeHandle<Object> FinishObject(const RdnString& first_key_desc,
+                                   uint32_t elements, uint32_t max_index,
                                    Handle<Map> feedback = Handle<Map>());
   // Slow path: first key already materialized (rare paths: ParseBrace slow
   // disambiguation, deprecated map fallback). Uses simple AddProperty loop.
@@ -137,9 +174,11 @@ class RdnParser final {
   // Must be called after the opening '"' has been consumed.
   // Returns a descriptor; call MakeString() to materialize.
   RdnString ScanRdnString(bool needs_internalization);
+  RdnString ScanRdnPropertyKey(uint32_t* elements, uint32_t* max_index);
   Handle<String> MakeString(const RdnString& string,
                             Handle<String> hint = Handle<String>());
   base::Vector<const Char> GetKeyChars(const RdnString& key) {
+    DCHECK(!key.is_index());
     return base::Vector<const Char>(chars_ + key.start(), key.length());
   }
 
@@ -154,11 +193,9 @@ class RdnParser final {
   base::uc32 ScanUnicodeCharacter();
 
   V8_INLINE void SkipWhitespace() {
-    while (cursor_ < end_) {
-      Char c = *cursor_;
-      if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
-      cursor_++;
-    }
+    cursor_ = std::find_if(cursor_, end_, [](Char c) {
+      return c != ' ' && c != '\n' && c != '\r' && c != '\t';
+    });
   }
 
   V8_INLINE base::uc32 CurrentChar() const {
@@ -237,7 +274,7 @@ class RdnParser final {
   // The maps are stored in a heap-allocated FixedArray for GC safety —
   // Handle<Map> members become dangling when the local HandleScope is closed
   // by CloseAndEscape, but FixedArray entries are properly traced by GC.
-  static constexpr int kObjectMapCacheSize = 4;
+  static constexpr int kObjectMapCacheSize = 16;
   Handle<FixedArray> object_map_cache_;
   int object_map_cache_counts_[kObjectMapCacheSize] = {};
   int object_map_cache_next_ = 0;  // round-robin insertion index
@@ -261,6 +298,9 @@ class RdnParser final {
 
   // Cached object constructor for fast empty {} creation.
   Handle<JSFunction> object_constructor_;
+
+  // Cached Date constructor — avoids isolate_->date_function() lookup per call.
+  Handle<JSFunction> date_constructor_;
 
   // Whether the map cache has ever been populated. Skips the 4-entry linear
   // scan in ParseBrace when all entries are empty.

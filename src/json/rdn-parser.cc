@@ -42,8 +42,10 @@
 #include "src/objects/field-type.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/transitions.h"
+#include "src/objects/js-objects-inl.h"
 #include "src/strings/char-predicates-inl.h"
 #include "src/utils/boxed-float.h"
+#include "src/utils/utils-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -209,7 +211,7 @@ static constexpr bool kDateTimeCharValid[256] = {
 // Returns true for characters that terminate a datetime/duration token.
 constexpr bool IsDateTimeTerminator(uint8_t c) {
   return c == ' ' || c == '\n' || c == '\r' || c == '\t' ||
-         c == ',' || c == '}' || c == ']' || c == ')';
+         c == ',' || c == '}' || c == ']' || c == ')' || c == '=';
 }
 
 static constexpr bool kDateTimeTerminator[256] = {
@@ -803,14 +805,17 @@ class RdnDataObjectBuilder {
 // RdnDataObjectBuilder::CreateAndInitialiseObject (the "revisit values" phase).
 class RdnNamedPropertyValueIterator {
  public:
-  RdnNamedPropertyValueIterator(const RdnProperty* it,
-                                const RdnProperty* end V8_ALLOW_UNUSED)
-      : it_(it) {
+  RdnNamedPropertyValueIterator(const RdnProperty* it, const RdnProperty* end)
+      : it_(it), end_(end) {
     DCHECK_LE(it, end);
+    DCHECK_IMPLIES(it_ != end_, !it_->string.is_index());
   }
 
   RdnNamedPropertyValueIterator& operator++() {
-    it_++;
+    DCHECK_LT(it_, end_);
+    do {
+      it_++;
+    } while (it_ != end_ && it_->string.is_index());
     return *this;
   }
 
@@ -822,6 +827,7 @@ class RdnNamedPropertyValueIterator {
 
  private:
   const RdnProperty* it_;
+  const RdnProperty* end_;
 };
 
 }  // namespace
@@ -835,13 +841,19 @@ class RdnParser<Char>::RdnNamedPropertyIterator {
  public:
   RdnNamedPropertyIterator(RdnParser<Char>& parser, const RdnProperty* it,
                             const RdnProperty* end)
-      : parser_(parser), start_(it), it_(it), end_(end) {
+      : parser_(parser), it_(it), end_(end) {
     DCHECK_LE(it_, end_);
+    while (it_ != end_ && it_->string.is_index()) {
+      it_++;
+    }
+    start_ = it_;
   }
 
   void Advance() {
     DCHECK_LT(it_, end_);
-    it_++;
+    do {
+      it_++;
+    } while (it_ != end_ && it_->string.is_index());
   }
 
   bool Done() const {
@@ -895,6 +907,8 @@ RdnParser<Char>::RdnParser(Isolate* isolate, Handle<String> source)
   type_map_cache_ = factory_->NewFixedArray(kTypeCacheSize);
   // Cache the Object constructor for fast empty {} creation.
   object_constructor_ = handle(isolate_->native_context()->object_function(), isolate_);
+  // Cache the Date constructor — avoids per-call isolate_->date_function() lookup.
+  date_constructor_ = handle(isolate_->native_context()->date_function(), isolate_);
   // Eagerly initialize TimeOnly/Duration key strings in the outermost
   // HandleScope so they survive all nested HandleScope closes.
   EnsureTimeKeysInitialized();
@@ -952,7 +966,7 @@ MaybeHandle<Object> RdnParser<Char>::Parse(Isolate* isolate,
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseRdn() {
   MaybeHandle<Object> result = ParseValue();
-  if (has_error_) return MaybeHandle<Object>();
+  if (has_error_ || result.is_null()) return MaybeHandle<Object>();
 
   SkipWhitespace();
   if (!IsAtEnd()) {
@@ -969,12 +983,14 @@ template <typename Char>
 void RdnParser<Char>::ReportError(const char* message) {
   if (has_error_) return;
   has_error_ = true;
+  // Don't throw if there's already a pending exception (e.g. from
+  // StackOverflow).
+  if (isolate_->has_exception()) return;
   int pos = static_cast<int>(cursor_ - chars_);
-  char buf[128];
-  snprintf(buf, sizeof(buf), "%s at position %d", message, pos);
-  Handle<String> error_str = factory_->NewStringFromAsciiChecked(buf);
+  DirectHandle<Object> arg1 = factory_->NewStringFromAsciiChecked(message);
+  DirectHandle<Object> arg2(Smi::FromInt(pos), isolate_);
   Handle<Object> error = factory_->NewSyntaxError(
-      MessageTemplate::kJsonParseUnexpectedEOS, error_str);
+      MessageTemplate::kRdnParseError, arg1, arg2);
   isolate_->Throw(*error);
 }
 
@@ -1008,6 +1024,50 @@ base::uc32 RdnParser<Char>::ScanUnicodeCharacter() {
     value = value * 16 + digit;
   }
   return value;
+}
+
+// ── ScanRdnPropertyKey ────────────────────────────────────────────
+// Scans a property key after the opening '"' has been consumed.
+// Detects array-index keys (pure digit sequences that fit uint32_t)
+// and returns them as RdnString(index) to allow correct element storage.
+// Mirrors ScanJsonPropertyKey in json-parser.cc.
+template <typename Char>
+RdnString RdnParser<Char>::ScanRdnPropertyKey(uint32_t* elements,
+                                                uint32_t* max_index) {
+  {
+    DisallowGarbageCollection no_gc;
+    const Char* start = cursor_;
+    base::uc32 first = CurrentChar();
+    if (IsDecimalDigit(first)) {
+      if (first == '0') {
+        Advance();
+        if (CurrentChar() == '"') {
+          Advance();  // skip closing "
+          (*elements)++;
+          return RdnString(0);
+        }
+      } else {
+        uint32_t index = first - '0';
+        while (true) {
+          cursor_ = std::find_if(cursor_ + 1, end_, [&index](Char c) {
+            return !IsDecimalDigit(c) || !TryAddArrayIndexChar(&index, c);
+          });
+
+          if (CurrentChar() == '"') {
+            Advance();  // skip closing "
+            (*elements)++;
+            *max_index = std::max(*max_index, index);
+            return RdnString(index);
+          }
+
+          break;
+        }
+      }
+    }
+    // Not an index key — reset cursor and fall through to ScanRdnString.
+    cursor_ = start;
+  }
+  return ScanRdnString(true);
 }
 
 template <typename Char>
@@ -1472,6 +1532,17 @@ MaybeHandle<Object> RdnParser<Char>::ParseNumber() {
       // BigInt suffix after long integer
       if (c == 'n') {
         cursor_++;
+        // int64 fast-path: up to 18 digits fits in int64_t without overflow.
+        // Avoids string allocation + StringToBigInt for common medium BigInts.
+        int digit_count = static_cast<int>(cursor_ - 1 - smi_start);
+        if (digit_count <= 18) {
+          int64_t val = 0;
+          for (const Char* p = smi_start; p < cursor_ - 1; p++) {
+            val = val * 10 + (*p - '0');
+          }
+          AllowGarbageCollection allow_gc;
+          return BigInt::FromInt64(isolate_, val * sign);
+        }
         AllowGarbageCollection allow_gc;
         goto bigint_slow_path_from_current;
       }
@@ -1739,6 +1810,13 @@ bool RdnParser<Char>::ParseNumberRaw(double* result_double, int* result_smi,
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseArray() {
+  {
+    StackLimitCheck check(isolate_);
+    if (V8_UNLIKELY(check.HasOverflowed())) {
+      isolate_->StackOverflow();
+      return MaybeHandle<Object>();
+    }
+  }
   HandleScope handle_scope(isolate_);
   Advance();  // skip [
   SkipWhitespace();
@@ -1950,6 +2028,13 @@ MaybeHandle<Object> RdnParser<Char>::ParseArray() {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseTuple() {
+  {
+    StackLimitCheck check(isolate_);
+    if (V8_UNLIKELY(check.HasOverflowed())) {
+      isolate_->StackOverflow();
+      return MaybeHandle<Object>();
+    }
+  }
   HandleScope handle_scope(isolate_);
   Advance();  // skip (
   SkipWhitespace();
@@ -1997,6 +2082,13 @@ MaybeHandle<Object> RdnParser<Char>::ParseTuple() {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
+  {
+    StackLimitCheck check(isolate_);
+    if (V8_UNLIKELY(check.HasOverflowed())) {
+      isolate_->StackOverflow();
+      return MaybeHandle<Object>();
+    }
+  }
   Advance();  // skip {
   SkipWhitespace();
 
@@ -2132,7 +2224,9 @@ MaybeHandle<Object> RdnParser<Char>::ParseBrace() {
     if (sep == ':') {
       // Object: {"key": value, ...}
       // Pass raw RdnString descriptor — materialization deferred to builder.
-      return FinishObject(key_desc, feedback);
+      // elements/max_index start at 0; FinishObject retroactively checks
+      // the first key and uses ScanRdnPropertyKey for subsequent keys.
+      return FinishObject(key_desc, 0, 0, feedback);
     }
     // Materialize for non-object paths (Map, Set).
     Handle<String> first_str = MakeString(key_desc);
@@ -2362,12 +2456,15 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
 
     // ── Slow fallback ─────────────────────────────────────────────
     // Push matched keys (from descriptors) and remaining keys (from
-    // ScanRdnString) onto property_stack_, then build via
+    // ScanRdnPropertyKey) onto property_stack_, then build via
     // RdnDataObjectBuilder for optimal map transitions.
     {
       size_t prop_start = property_stack_.size();
+      uint32_t elem_count = 0;
+      uint32_t elem_max_index = 0;
 
       // Push already-matched keys from descriptors (pre-materialized).
+      // These are always named properties (not indices).
       for (int i = 0; i < matched; i++) {
         Handle<String> key(
             Cast<String>(descriptors->GetKey(InternalIndex(i))), isolate_);
@@ -2379,7 +2476,8 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
       if (matched < nof_descriptors) {
         if (!IsAtEnd() && CurrentChar() == '"') {
           Advance();  // skip opening "
-          RdnString key_desc = ScanRdnString(true);
+          RdnString key_desc =
+              ScanRdnPropertyKey(&elem_count, &elem_max_index);
           if (has_error_) {
             property_stack_.resize(prop_start);
             return MaybeHandle<Object>();
@@ -2408,7 +2506,8 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
           return MaybeHandle<Object>();
         }
         Advance();  // skip opening "
-        RdnString key_desc = ScanRdnString(true);
+        RdnString key_desc =
+            ScanRdnPropertyKey(&elem_count, &elem_max_index);
         if (has_error_) {
           property_stack_.resize(prop_start);
           return MaybeHandle<Object>();
@@ -2434,19 +2533,60 @@ MaybeHandle<Object> RdnParser<Char>::FinishObjectFastKeys(
       Advance();  // skip '}'
 
       int count = static_cast<int>(property_stack_.size() - prop_start);
+      int named_count = count - static_cast<int>(elem_count);
+
+      // Build element backing store for index properties.
+      Handle<FixedArrayBase> elms;
+      ElementsKind elements_kind = HOLEY_ELEMENTS;
+      if (elem_count > 0) {
+        if (ShouldConvertToSlowElements(elem_count, elem_max_index + 1)) {
+          Handle<NumberDictionary> dict =
+              NumberDictionary::New(isolate_, elem_count);
+          for (int i = 0; i < count; i++) {
+            const RdnProperty& property = property_stack_[prop_start + i];
+            if (!property.string.is_index()) continue;
+            uint32_t index = property.string.index();
+            DirectHandle<Object> value = property.value;
+            NumberDictionary::UncheckedSet(isolate_, dict, index, value);
+          }
+          dict->SetInitialNumberOfElements(elem_count);
+          dict->UpdateMaxNumberKey(elem_max_index, Handle<JSObject>::null());
+          elements_kind = DICTIONARY_ELEMENTS;
+          elms = dict;
+        } else {
+          Handle<FixedArray> arr = factory_->NewFixedArrayWithHoles(
+              elem_max_index + 1, AllocationType::kYoung);
+          DisallowGarbageCollection no_gc;
+          Tagged<FixedArray> raw_elements = *arr;
+          for (int i = 0; i < count; i++) {
+            const RdnProperty& property = property_stack_[prop_start + i];
+            if (!property.string.is_index()) continue;
+            uint32_t index = property.string.index();
+            raw_elements->set(static_cast<int>(index), *property.value,
+                              SKIP_WRITE_BARRIER);
+          }
+          elms = arr;
+        }
+      } else {
+        elms = factory_->empty_fixed_array();
+      }
+
       RdnDataObjectBuilder builder(
-          isolate_, HOLEY_ELEMENTS, count, feedback,
+          isolate_, elements_kind, named_count, feedback,
           RdnDataObjectBuilder::kHeapNumbersGuaranteedUniquelyOwned);
       RdnNamedPropertyIterator prop_it(
           *this, &property_stack_[prop_start],
           &property_stack_[prop_start] + count);
-      Handle<JSObject> obj = builder.BuildFromIterator(prop_it);
+      Handle<JSObject> obj = builder.BuildFromIterator(prop_it, elms);
 
-      object_map_cache_->set(object_map_cache_next_, obj->map());
-      object_map_cache_counts_[object_map_cache_next_] = count;
-      object_map_cache_next_ =
-          (object_map_cache_next_ + 1) % kObjectMapCacheSize;
-      map_cache_populated_ = true;
+      // Only update map cache for pure named-property objects.
+      if (elem_count == 0) {
+        object_map_cache_->set(object_map_cache_next_, obj->map());
+        object_map_cache_counts_[object_map_cache_next_] = count;
+        object_map_cache_next_ =
+            (object_map_cache_next_ + 1) % kObjectMapCacheSize;
+        map_cache_populated_ = true;
+      }
 
       property_stack_.resize(prop_start);
       return handle_scope.CloseAndEscape(handle(*obj, isolate_));
@@ -2476,16 +2616,49 @@ slow_fallback_start:
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_desc,
+                                                   uint32_t elements,
+                                                   uint32_t max_index,
                                                    Handle<Map> feedback) {
   HandleScope handle_scope(isolate_);
   Advance();  // skip :
 
   size_t start = property_stack_.size();
 
+  // Retroactively check if the first key (scanned by ParseBrace before
+  // disambiguation) is an array-index key. ParseBrace uses ScanRdnString
+  // because it needs chars for Map/Set disambiguation, but now that we
+  // know this is an object, re-check for index patterns like "0", "42".
+  RdnString effective_first_key = first_key_desc;
+  if (!first_key_desc.is_index()) {
+    base::Vector<const Char> key_chars = GetKeyChars(first_key_desc);
+    uint32_t len = key_chars.length();
+    if (len > 0 && IsDecimalDigit(key_chars[0])) {
+      if (len == 1 && key_chars[0] == '0') {
+        effective_first_key = RdnString(0);
+        elements++;
+      } else if (key_chars[0] != '0') {
+        uint32_t index = key_chars[0] - '0';
+        bool valid = true;
+        for (uint32_t j = 1; j < len; j++) {
+          if (!IsDecimalDigit(key_chars[j]) ||
+              !TryAddArrayIndexChar(&index, key_chars[j])) {
+            valid = false;
+            break;
+          }
+        }
+        if (valid) {
+          effective_first_key = RdnString(index);
+          elements++;
+          max_index = std::max(max_index, index);
+        }
+      }
+    }
+  }
+
   // Parse first value and push with deferred key.
   Handle<Object> first_val;
   ASSIGN_RETURN_ON_EXCEPTION(isolate_, first_val, ParseValue());
-  property_stack_.push_back(RdnProperty(first_key_desc, first_val));
+  property_stack_.push_back(RdnProperty(effective_first_key, first_val));
   SkipWhitespace();
 
   // Parse remaining properties with deferred key materialization.
@@ -2513,9 +2686,9 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
       return MaybeHandle<Object>();
     }
 
-    // Deferred key scan — NO MakeString call.
+    // Deferred key scan — detects array-index keys.
     Advance();  // skip opening "
-    RdnString key_desc = ScanRdnString(true);
+    RdnString key_desc = ScanRdnPropertyKey(&elements, &max_index);
     if (has_error_) {
       property_stack_.resize(start);
       return MaybeHandle<Object>();
@@ -2536,10 +2709,12 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
   }
 
   int count = static_cast<int>(property_stack_.size() - start);
+  int named_count = count - static_cast<int>(elements);
 
   // ── kUnknown learning ───────────────────────────────────────────
   // Validate parsed keys against the feedback descriptor array to promote
   // or demote the fast-iterable state for future parses.
+  // Index properties break fast iteration — demote to slow.
   if (!feedback.is_null()) {
     using FastIterableState = DescriptorArray::FastIterableState;
     Handle<DescriptorArray> descriptors(
@@ -2548,8 +2723,8 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
 
     if (descriptors->fast_iterable() == FastIterableState::kUnknown &&
         nof == count) {
-      bool all_fast = true;
-      {
+      bool all_fast = elements == 0;
+      if (all_fast) {
         DisallowGarbageCollection no_gc;
         Tagged<DescriptorArray> desc = *descriptors;
         for (int i = 0; i < count; i++) {
@@ -2591,7 +2766,8 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
   // ── Map cache fast path ─────────────────────────────────────────
   // Search the multi-entry map cache for a matching shape. On hit,
   // stamp out properties directly via FastPropertyAtPut (no transitions).
-  if (map_cache_populated_) {
+  // Skip when object has index properties — cache only handles named props.
+  if (elements == 0 && map_cache_populated_) {
     for (int ci = 0; ci < kObjectMapCacheSize; ci++) {
       if (object_map_cache_counts_[ci] != count) continue;
       Tagged<Object> cached_entry = object_map_cache_->get(ci);
@@ -2686,24 +2862,62 @@ MaybeHandle<Object> RdnParser<Char>::FinishObject(const RdnString& first_key_des
   // The builder uses GetKeyChars() for fast expected-transition matching and
   // only materializes strings (via GetKey) when needed.
   {
+    // Build element backing store for index properties.
+    Handle<FixedArrayBase> elms;
+    ElementsKind elements_kind = HOLEY_ELEMENTS;
+    if (elements > 0) {
+      if (ShouldConvertToSlowElements(elements, max_index + 1)) {
+        Handle<NumberDictionary> dict =
+            NumberDictionary::New(isolate_, elements);
+        for (int i = 0; i < count; i++) {
+          const RdnProperty& property = property_stack_[start + i];
+          if (!property.string.is_index()) continue;
+          uint32_t index = property.string.index();
+          DirectHandle<Object> value = property.value;
+          NumberDictionary::UncheckedSet(isolate_, dict, index, value);
+        }
+        dict->SetInitialNumberOfElements(elements);
+        dict->UpdateMaxNumberKey(max_index, Handle<JSObject>::null());
+        elements_kind = DICTIONARY_ELEMENTS;
+        elms = dict;
+      } else {
+        Handle<FixedArray> arr = factory_->NewFixedArrayWithHoles(
+            max_index + 1, AllocationType::kYoung);
+        DisallowGarbageCollection no_gc;
+        Tagged<FixedArray> raw_elements = *arr;
+        for (int i = 0; i < count; i++) {
+          const RdnProperty& property = property_stack_[start + i];
+          if (!property.string.is_index()) continue;
+          uint32_t index = property.string.index();
+          raw_elements->set(static_cast<int>(index), *property.value,
+                            SKIP_WRITE_BARRIER);
+        }
+        elms = arr;
+      }
+    } else {
+      elms = factory_->empty_fixed_array();
+    }
+
     Handle<Map> expected_map;
     if (!feedback.is_null() && !feedback->is_deprecated()) {
       expected_map = feedback;
     }
     RdnDataObjectBuilder builder(
-        isolate_, HOLEY_ELEMENTS, count, expected_map,
+        isolate_, elements_kind, named_count, expected_map,
         RdnDataObjectBuilder::kHeapNumbersGuaranteedUniquelyOwned);
     RdnNamedPropertyIterator it(
         *this, &property_stack_[start],
         &property_stack_[start] + count);
-    Handle<JSObject> obj = builder.BuildFromIterator(it);
+    Handle<JSObject> obj = builder.BuildFromIterator(it, elms);
 
-    // Update map cache (round-robin).
-    object_map_cache_->set(object_map_cache_next_, obj->map());
-    object_map_cache_counts_[object_map_cache_next_] = count;
-    object_map_cache_next_ =
-        (object_map_cache_next_ + 1) % kObjectMapCacheSize;
-    map_cache_populated_ = true;
+    // Only update map cache for pure named-property objects.
+    if (elements == 0) {
+      object_map_cache_->set(object_map_cache_next_, obj->map());
+      object_map_cache_counts_[object_map_cache_next_] = count;
+      object_map_cache_next_ =
+          (object_map_cache_next_ + 1) % kObjectMapCacheSize;
+      map_cache_populated_ = true;
+    }
 
     property_stack_.resize(start);
     return handle_scope.CloseAndEscape(handle(*obj, isolate_));
@@ -2786,8 +3000,9 @@ MaybeHandle<Object> RdnParser<Char>::FinishMap(Handle<Object> first_key) {
   HandleScope handle_scope(isolate_);
   Advance(2);  // skip =>
   DirectHandle<JSMap> map = factory_->NewJSMap();
-  Handle<OrderedHashMap> table(
-      Cast<OrderedHashMap>(map->table()), isolate_);
+  static constexpr int kMapPreallocCapacity = 8;
+  Handle<OrderedHashMap> table = OrderedHashMap::Allocate(isolate_, kMapPreallocCapacity).ToHandleChecked();
+  map->set_table(*table);
 
   Handle<Object> ikey = first_key;
   if (IsString(*ikey)) {
@@ -2843,8 +3058,9 @@ MaybeHandle<Object> RdnParser<Char>::FinishSet(Handle<Object> first_value) {
   HandleScope handle_scope(isolate_);
   Advance();  // skip ,
   DirectHandle<JSSet> set = factory_->NewJSSet();
-  Handle<OrderedHashSet> table(
-      Cast<OrderedHashSet>(set->table()), isolate_);
+  static constexpr int kSetPreallocCapacity = 8;
+  Handle<OrderedHashSet> table = OrderedHashSet::Allocate(isolate_, kSetPreallocCapacity).ToHandleChecked();
+  set->set_table(*table);
   Handle<Object> ival = first_value;
   if (IsString(*ival)) {
     ival = factory_->InternalizeString(Cast<String>(ival));
@@ -2884,6 +3100,13 @@ MaybeHandle<Object> RdnParser<Char>::FinishSet(Handle<Object> first_value) {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseMapKeyword() {
+  {
+    StackLimitCheck check(isolate_);
+    if (V8_UNLIKELY(check.HasOverflowed())) {
+      isolate_->StackOverflow();
+      return MaybeHandle<Object>();
+    }
+  }
   if (!Match("Map{", 4)) {
     ReportError("Expected 'Map{'");
     return MaybeHandle<Object>();
@@ -2910,6 +3133,13 @@ MaybeHandle<Object> RdnParser<Char>::ParseMapKeyword() {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::ParseSetKeyword() {
+  {
+    StackLimitCheck check(isolate_);
+    if (V8_UNLIKELY(check.HasOverflowed())) {
+      isolate_->StackOverflow();
+      return MaybeHandle<Object>();
+    }
+  }
   if (!Match("Set{", 4)) {
     ReportError("Expected 'Set{'");
     return MaybeHandle<Object>();
@@ -3001,6 +3231,75 @@ MaybeHandle<Object> RdnParser<Char>::ParseDateTime() {
 
   // Duration: @P...
   if (CurrentChar() == 'P') return ParseDuration();
+
+  // ── Speculative fast-path for @YYYY-MM-DDTHH:MM:SS.mmmZ (24 chars) ──
+  // The dominant datetime format in typical RDN data. Checks structural
+  // positions directly without scanning every character, then extracts
+  // fields inline via ReadYear/ReadDigitPair/ReadMillis + CivilToEpochMs.
+  // Falls through to the general scan loop on mismatch.
+  {
+    const Char* p = cursor_;
+    size_t rem = end_ - p;
+    if (rem >= 24 &&
+        p[4] == '-' && p[7] == '-' && p[10] == 'T' &&
+        p[13] == ':' && p[16] == ':' && p[19] == '.' && p[23] == 'Z') {
+      bool ok = IsDecimalDigit(p[0]) && IsDecimalDigit(p[1]) &&
+                IsDecimalDigit(p[2]) && IsDecimalDigit(p[3]) &&
+                IsDecimalDigit(p[5]) && IsDecimalDigit(p[6]) &&
+                IsDecimalDigit(p[8]) && IsDecimalDigit(p[9]) &&
+                IsDecimalDigit(p[11]) && IsDecimalDigit(p[12]) &&
+                IsDecimalDigit(p[14]) && IsDecimalDigit(p[15]) &&
+                IsDecimalDigit(p[17]) && IsDecimalDigit(p[18]) &&
+                IsDecimalDigit(p[20]) && IsDecimalDigit(p[21]) &&
+                IsDecimalDigit(p[22]);
+      // Verify the character after the token is a terminator (or end of input).
+      bool terminated = (rem == 24) ||
+                        (p[24] <= 0xFF &&
+                         kDateTimeTerminator[static_cast<uint8_t>(p[24])]);
+      if (ok && terminated) {
+        int year = ReadYear(p);
+        int month = ReadDigitPair(p + 5);
+        int day = ReadDigitPair(p + 8);
+        int hour = ReadDigitPair(p + 11);
+        int min = ReadDigitPair(p + 14);
+        int sec = ReadDigitPair(p + 17);
+        int ms = ReadMillis(p + 20);
+        if (month >= 1 && month <= 12 && day >= 1 && day <= 31 &&
+            hour <= 23 && min <= 59 && sec <= 59) {
+          cursor_ = p + 24;
+          return MakeDate(CivilToEpochMs(year, month, day, hour, min, sec, ms));
+        }
+      }
+    }
+    // Also try @YYYY-MM-DDTHH:MM:SSZ (20 chars, no millis).
+    if (rem >= 20 &&
+        p[4] == '-' && p[7] == '-' && p[10] == 'T' &&
+        p[13] == ':' && p[16] == ':' && p[19] == 'Z') {
+      bool ok = IsDecimalDigit(p[0]) && IsDecimalDigit(p[1]) &&
+                IsDecimalDigit(p[2]) && IsDecimalDigit(p[3]) &&
+                IsDecimalDigit(p[5]) && IsDecimalDigit(p[6]) &&
+                IsDecimalDigit(p[8]) && IsDecimalDigit(p[9]) &&
+                IsDecimalDigit(p[11]) && IsDecimalDigit(p[12]) &&
+                IsDecimalDigit(p[14]) && IsDecimalDigit(p[15]) &&
+                IsDecimalDigit(p[17]) && IsDecimalDigit(p[18]);
+      bool terminated = (rem == 20) ||
+                        (p[20] <= 0xFF &&
+                         kDateTimeTerminator[static_cast<uint8_t>(p[20])]);
+      if (ok && terminated) {
+        int year = ReadYear(p);
+        int month = ReadDigitPair(p + 5);
+        int day = ReadDigitPair(p + 8);
+        int hour = ReadDigitPair(p + 11);
+        int min = ReadDigitPair(p + 14);
+        int sec = ReadDigitPair(p + 17);
+        if (month >= 1 && month <= 12 && day >= 1 && day <= 31 &&
+            hour <= 23 && min <= 59 && sec <= 59) {
+          cursor_ = p + 20;
+          return MakeDate(CivilToEpochMs(year, month, day, hour, min, sec, 0));
+        }
+      }
+    }
+  }
 
   // ── Fused scan + classify + parse in a single pass ──────────────
   // Instead of: scan → classify → allocate string → parse string,
@@ -3421,10 +3720,25 @@ MaybeHandle<Object> RdnParser<Char>::ParseBinaryB64() {
   int str_len = static_cast<int>(cursor_ - b64_start);
   Advance();  // skip closing "
 
+  // Reject non-multiple-of-4 lengths (RFC 4648).
+  if (str_len > 0 && str_len % 4 != 0) {
+    ReportError("Invalid base64: length must be a multiple of 4");
+    return MaybeHandle<Object>();
+  }
+
   // Count padding to compute exact decoded length.
   int padding = 0;
   if (str_len >= 1 && b64_start[str_len - 1] == '=') padding++;
   if (str_len >= 2 && b64_start[str_len - 2] == '=') padding++;
+
+  // Reject padding characters in non-terminal positions.
+  for (int i = 0; i < str_len - padding; i++) {
+    if (b64_start[i] == '=') {
+      ReportError("Invalid base64: padding character in non-terminal position");
+      return MaybeHandle<Object>();
+    }
+  }
+
   int decoded_len = (str_len * 3) / 4 - padding;
   if (decoded_len < 0) decoded_len = 0;
 
@@ -3438,28 +3752,71 @@ MaybeHandle<Object> RdnParser<Char>::ParseBinaryB64() {
   if (decoded_len > 0) {
     uint8_t* out = static_cast<uint8_t*>(buffer->backing_store());
     int out_pos = 0;
-    uint32_t accum = 0;
-    int bits = 0;
 
-    for (int i = 0; i < str_len; i++) {
-      Char ch = b64_start[i];
-      if (ch == '=') continue;
-      if (ch > 255) {
+    // Process full 4-byte groups (no padding) in bulk — eliminates per-char
+    // branching for '=' checks and bit-threshold tests.
+    int full_groups = (str_len / 4) - (padding > 0 ? 1 : 0);
+    int i = 0;
+    for (int g = 0; g < full_groups; g++, i += 4) {
+      uint8_t ca = static_cast<uint8_t>(b64_start[i]);
+      uint8_t cb = static_cast<uint8_t>(b64_start[i + 1]);
+      uint8_t cc = static_cast<uint8_t>(b64_start[i + 2]);
+      uint8_t cd = static_cast<uint8_t>(b64_start[i + 3]);
+      int8_t a = kB64DecodeTable[ca];
+      int8_t b = kB64DecodeTable[cb];
+      int8_t c = kB64DecodeTable[cc];
+      int8_t d = kB64DecodeTable[cd];
+      if (V8_UNLIKELY((a | b | c | d) < 0)) {
         ReportError("Invalid base64 character");
         return MaybeHandle<Object>();
       }
-      int8_t val = kB64DecodeTable[static_cast<uint8_t>(ch)];
-      if (val < 0) {
+      uint32_t triple = (static_cast<uint32_t>(a) << 18) |
+                         (static_cast<uint32_t>(b) << 12) |
+                         (static_cast<uint32_t>(c) << 6) |
+                         static_cast<uint32_t>(d);
+      out[out_pos++] = static_cast<uint8_t>(triple >> 16);
+      out[out_pos++] = static_cast<uint8_t>((triple >> 8) & 0xFF);
+      out[out_pos++] = static_cast<uint8_t>(triple & 0xFF);
+    }
+
+    // Handle last group with padding (0, 1, or 2 padding chars).
+    if (padding > 0) {
+      DCHECK_EQ(i + 4, str_len);
+      int8_t a = kB64DecodeTable[static_cast<uint8_t>(b64_start[i])];
+      int8_t b = kB64DecodeTable[static_cast<uint8_t>(b64_start[i + 1])];
+      if (V8_UNLIKELY(a < 0 || b < 0)) {
         ReportError("Invalid base64 character");
         return MaybeHandle<Object>();
       }
-      accum = (accum << 6) | static_cast<uint32_t>(val);
-      bits += 6;
-      if (bits >= 8) {
-        bits -= 8;
-        out[out_pos++] = static_cast<uint8_t>((accum >> bits) & 0xFF);
+      if (padding == 2) {
+        // 2 padding chars → 1 output byte
+        // Reject non-zero padding bits (RFC 4648 §3.5).
+        if (V8_UNLIKELY(b & 0x0F)) {
+          ReportError("Invalid base64: non-zero padding bits");
+          return MaybeHandle<Object>();
+        }
+        out[out_pos++] = static_cast<uint8_t>(
+            (static_cast<uint32_t>(a) << 2) | (static_cast<uint32_t>(b) >> 4));
+      } else {
+        // 1 padding char → 2 output bytes
+        int8_t c = kB64DecodeTable[static_cast<uint8_t>(b64_start[i + 2])];
+        if (V8_UNLIKELY(c < 0)) {
+          ReportError("Invalid base64 character");
+          return MaybeHandle<Object>();
+        }
+        // Reject non-zero padding bits (RFC 4648 §3.5).
+        if (V8_UNLIKELY(c & 0x03)) {
+          ReportError("Invalid base64: non-zero padding bits");
+          return MaybeHandle<Object>();
+        }
+        uint32_t triple = (static_cast<uint32_t>(a) << 18) |
+                           (static_cast<uint32_t>(b) << 12) |
+                           (static_cast<uint32_t>(c) << 6);
+        out[out_pos++] = static_cast<uint8_t>(triple >> 16);
+        out[out_pos++] = static_cast<uint8_t>((triple >> 8) & 0xFF);
       }
     }
+    DCHECK_EQ(out_pos, decoded_len);
   }
 
   return factory_->NewJSTypedArray(kExternalUint8Array, buffer, 0, decoded_len);
@@ -3528,9 +3885,8 @@ MaybeHandle<Object> RdnParser<Char>::ParseBinaryHex() {
 
 template <typename Char>
 MaybeHandle<Object> RdnParser<Char>::MakeDate(double time_ms) {
-  DirectHandle<JSFunction> date_ctor(isolate_->date_function());
   MaybeDirectHandle<JSDate> date =
-      JSDate::New(isolate_, date_ctor, date_ctor, time_ms);
+      JSDate::New(isolate_, date_constructor_, date_constructor_, time_ms);
   if (date.is_null()) {
     ReportError("Invalid date value");
     return MaybeHandle<Object>();
